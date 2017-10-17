@@ -14,8 +14,12 @@
 
 import os
 
-import keystone_context as context
 from mock import patch, MagicMock
+with patch('charmhelpers.contrib.openstack.'
+           'utils.snap_install_requested') as snap_install_requested:
+    snap_install_requested.return_value = False
+    import keystone_utils  # noqa
+    import keystone_context as context
 
 from test_utils import (
     CharmTestCase
@@ -99,11 +103,11 @@ class TestKeystoneContexts(CharmTestCase):
         ctxt.configure_cert = MagicMock()
         ctxt.configure_ca = MagicMock()
         ctxt.canonical_names = MagicMock()
-        self.assertEquals(ctxt(), {'endpoints': [('1.2.3.4',
-                                                  '1.2.3.4',
-                                                  34, 12)],
-                                   'namespace': 'keystone',
-                                   'ext_ports': [34]})
+        self.assertEqual(ctxt(), {'endpoints': [('1.2.3.4',
+                                                 '1.2.3.4',
+                                                 34, 12)],
+                                  'namespace': 'keystone',
+                                  'ext_ports': [34]})
         self.assertTrue(mock_https.called)
         mock_unit_get.assert_called_with('private-address')
 
@@ -140,7 +144,7 @@ class TestKeystoneContexts(CharmTestCase):
         ctxt = context.HAProxyContext()
 
         self.maxDiff = None
-        self.assertEquals(
+        self.assertEqual(
             ctxt(),
             {'listen_ports': {'admin_port': '12',
                               'public_port': '12'},
@@ -166,7 +170,9 @@ class TestKeystoneContexts(CharmTestCase):
         ctxt = context.KeystoneLoggingContext()
 
         mock_config.return_value = None
-        self.assertEqual({'log_level': None}, ctxt())
+        self.assertEqual({'log_level': None,
+                          'log_file': '/var/log/keystone/keystone.log'},
+                         ctxt())
 
     @patch.object(context, 'is_elected_leader')
     def test_token_flush_context(self, mock_is_elected_leader):

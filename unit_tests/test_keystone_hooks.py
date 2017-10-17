@@ -25,7 +25,10 @@ from test_utils import CharmTestCase
 sys.modules['apt'] = MagicMock()
 
 os.environ['JUJU_UNIT_NAME'] = 'keystone'
-with patch('charmhelpers.core.hookenv.config') as config:
+with patch('charmhelpers.core.hookenv.config') as config, \
+        patch('charmhelpers.contrib.openstack.'
+              'utils.snap_install_requested') as snap_install_requested:
+    snap_install_requested.return_value = False
     config.return_value = 'keystone'
     import keystone_utils as utils
 
@@ -69,6 +72,7 @@ TO_PATCH = [
     # charmhelpers.contrib.openstack.utils
     'configure_installation_source',
     'git_install_requested',
+    'snap_install_requested',
     # charmhelpers.contrib.openstack.ip
     'resolve_address',
     # charmhelpers.contrib.openstack.ha.utils
@@ -120,10 +124,13 @@ class KeystoneRelationTests(CharmTestCase):
         super(KeystoneRelationTests, self).setUp(hooks, TO_PATCH)
         self.config.side_effect = self.test_config.get
         self.ssh_user = 'juju_keystone'
+        self.snap_install_requested.return_value = False
 
     @patch.object(utils, 'os_release')
     @patch.object(utils, 'git_install_requested')
     @patch.object(unison, 'ensure_user')
+    @patch.object(hooks, 'service_stop', lambda *args: None)
+    @patch.object(hooks, 'service_start', lambda *args: None)
     def test_install_hook(self, ensure_user, git_requested, os_release):
         os_release.return_value = 'havana'
         git_requested.return_value = False
@@ -145,6 +152,8 @@ class KeystoneRelationTests(CharmTestCase):
     @patch.object(utils, 'os_release')
     @patch.object(utils, 'git_install_requested')
     @patch.object(unison, 'ensure_user')
+    @patch.object(hooks, 'service_stop', lambda *args: None)
+    @patch.object(hooks, 'service_start', lambda *args: None)
     def test_install_hook_apache2(self, ensure_user,
                                   git_requested, os_release):
         os_release.return_value = 'havana'
@@ -168,6 +177,8 @@ class KeystoneRelationTests(CharmTestCase):
     @patch.object(utils, 'os_release')
     @patch.object(utils, 'git_install_requested')
     @patch.object(unison, 'ensure_user')
+    @patch.object(hooks, 'service_stop', lambda *args: None)
+    @patch.object(hooks, 'service_start', lambda *args: None)
     def test_install_hook_git(self, ensure_user, git_requested, os_release):
         os_release.return_value = 'havana'
         git_requested.return_value = True
@@ -309,8 +320,8 @@ class KeystoneRelationTests(CharmTestCase):
         self.os_release.return_value = 'havana'
         mock_ensure_ssl_cert_master.return_value = False
         self._shared_db_test(configs, 'keystone/3')
-        self.assertEquals([call('/etc/keystone/keystone.conf')],
-                          configs.write.call_args_list)
+        self.assertEqual([call('/etc/keystone/keystone.conf')],
+                         configs.write.call_args_list)
         self.assertTrue(leader_init.called)
 
     @patch.object(hooks, 'leader_init_db_if_ready')
@@ -322,8 +333,8 @@ class KeystoneRelationTests(CharmTestCase):
         self.os_release.return_value = 'havana'
         mock_ensure_ssl_cert_master.return_value = False
         self._postgresql_db_test(configs)
-        self.assertEquals([call('/etc/keystone/keystone.conf')],
-                          configs.write.call_args_list)
+        self.assertEqual([call('/etc/keystone/keystone.conf')],
+                         configs.write.call_args_list)
         self.assertTrue(leader_init.called)
 
     @patch.object(hooks, 'update_all_domain_backends')
@@ -721,6 +732,7 @@ class KeystoneRelationTests(CharmTestCase):
         hooks.cluster_joined(rid='foo:1', ssl_sync_request=False)
         self.assertFalse(mock_send_ssl_sync_request.called)
 
+    @patch.object(hooks, 'relation_get_and_migrate')
     @patch.object(hooks, 'initialise_pki')
     @patch.object(hooks, 'update_all_identity_relation_units')
     @patch.object(hooks, 'get_ssl_sync_request_units')
@@ -742,16 +754,18 @@ class KeystoneRelationTests(CharmTestCase):
                              mock_is_ssl_cert_master,
                              mock_get_ssl_sync_request_units,
                              mock_update_all_identity_relation_units,
-                             mock_initialise_pki):
+                             mock_initialise_pki,
+                             mock_relation_get_and_migrate):
 
         relation_settings = {'foo_passwd': '123',
                              'identity-service:16_foo': 'bar'}
 
+        mock_relation_get_and_migrate.return_value = None
         mock_is_ssl_cert_master.return_value = False
         mock_peer_units.return_value = ['unit/0']
         mock_ensure_ssl_cert_master.return_value = False
         mock_relation_ids.return_value = []
-        self.is_elected_leader.return_value = False
+        self.is_leader.return_value = False
 
         def fake_rel_get(attribute=None, *args, **kwargs):
             if not attribute:
@@ -764,8 +778,8 @@ class KeystoneRelationTests(CharmTestCase):
         mock_config.return_value = None
 
         hooks.cluster_changed()
-        whitelist = ['_passwd', 'identity-service:', 'ssl-cert-master',
-                     'db-initialised', 'ssl-cert-available-updates']
+        whitelist = ['_passwd', 'identity-service:', 'db-initialised',
+                     'ssl-cert-available-updates', 'ssl-cert-master']
         self.peer_echo.assert_called_with(force=True, includes=whitelist)
         ssh_authorized_peers.assert_called_with(
             user=self.ssh_user, group='juju_keystone',
@@ -773,8 +787,9 @@ class KeystoneRelationTests(CharmTestCase):
         self.assertFalse(mock_synchronize_ca.called)
         self.assertTrue(configs.write_all.called)
 
+    @patch.object(hooks, 'update_all_identity_relation_units')
     @patch.object(hooks.CONFIGS, 'write')
-    def test_leader_elected(self, mock_write):
+    def test_leader_elected(self, mock_write, mock_update):
         hooks.leader_elected()
         mock_write.assert_has_calls([call(utils.TOKEN_FLUSH_CRON_FILE)])
 

@@ -28,6 +28,7 @@ import threading
 import time
 import urlparse
 import uuid
+import sys
 
 from itertools import chain
 from base64 import b64encode
@@ -74,6 +75,10 @@ from charmhelpers.contrib.openstack.utils import (
     make_assess_status_func,
     os_application_version_set,
     CompareOpenStackReleases,
+    reset_os_release,
+    snap_install_requested,
+    install_os_snaps,
+    get_snaps_install_info_from_origin,
 )
 
 from charmhelpers.contrib.python.packages import (
@@ -134,6 +139,7 @@ from charmhelpers.contrib.peerstorage import (
     peer_store_and_set,
     peer_store,
     peer_retrieve,
+    relation_set as relation_set_and_migrate_to_leader,
 )
 
 from charmhelpers.core.templating import render
@@ -159,6 +165,15 @@ BASE_PACKAGES = [
     'uuid',
 ]
 
+BASE_PACKAGES_SNAP = [
+    'haproxy',
+    'openssl',
+    'python-six',
+    'pwgen',
+    'unison',
+    'uuid',
+]
+
 VERSION_PACKAGE = 'keystone'
 
 BASE_GIT_PACKAGES = [
@@ -174,37 +189,76 @@ BASE_GIT_PACKAGES = [
     'zlib1g-dev',
 ]
 
-BASE_SERVICES = [
-    'keystone',
-]
-
 # ubuntu packages that should not be installed when deploying from git
 GIT_PACKAGE_BLACKLIST = [
     'keystone',
 ]
 
-KEYSTONE_CONF = "/etc/keystone/keystone.conf"
-KEYSTONE_LOGGER_CONF = "/etc/keystone/logging.conf"
-KEYSTONE_CONF_DIR = os.path.dirname(KEYSTONE_CONF)
-STORED_PASSWD = "/var/lib/keystone/keystone.passwd"
-STORED_TOKEN = "/var/lib/keystone/keystone.token"
-STORED_ADMIN_DOMAIN_ID = "/var/lib/keystone/keystone.admin_domain_id"
-STORED_DEFAULT_DOMAIN_ID = "/var/lib/keystone/keystone.default_domain_id"
-SERVICE_PASSWD_PATH = '/var/lib/keystone/services.passwd'
+
+SSH_USER = 'juju_keystone'
+if snap_install_requested():
+    SNAP_BASE_DIR = "/snap/keystone/current"
+    SNAP_COMMON_DIR = "/var/snap/keystone/common"
+    SNAP_COMMON_ETC_DIR = "{}/etc".format(SNAP_COMMON_DIR)
+    SNAP_COMMON_KEYSTONE_DIR = "{}/keystone".format(SNAP_COMMON_ETC_DIR)
+    KEYSTONE_USER = 'root'
+    KEYSTONE_CONF = ('{}/keystone.conf.d/keystone.conf'
+                     ''.format(SNAP_COMMON_KEYSTONE_DIR))
+    KEYSTONE_CONF_DIR = os.path.dirname(KEYSTONE_CONF)
+    KEYSTONE_NGINX_SITE_CONF = ("{}/nginx/sites-enabled/keystone-nginx.conf"
+                                "".format(SNAP_COMMON_ETC_DIR))
+    KEYSTONE_NGINX_CONF = "{}/nginx/nginx.conf".format(SNAP_COMMON_ETC_DIR)
+    KEYSTONE_LOGGER_CONF = "{}/logging.conf".format(SNAP_COMMON_KEYSTONE_DIR)
+    SNAP_LIB_DIR = '{}/lib'.format(SNAP_COMMON_DIR)
+    STORED_PASSWD = "{}/keystone.passwd".format(SNAP_LIB_DIR)
+    STORED_TOKEN = "{}/keystone.token".format(SNAP_LIB_DIR)
+    STORED_ADMIN_DOMAIN_ID = ("{}/keystone.admin_domain_id"
+                              "".format(SNAP_LIB_DIR))
+    STORED_DEFAULT_DOMAIN_ID = ("{}/keystone.default_domain_id"
+                                "".format(SNAP_LIB_DIR))
+    SERVICE_PASSWD_PATH = '{}/services.passwd'.format(SNAP_LIB_DIR)
+
+    SSH_USER_HOME = '/home/{}'.format(SSH_USER)
+    SYNC_FLAGS_DIR = '{}/juju_sync_flags/'.format(SSH_USER_HOME)
+    SYNC_DIR = '{}/juju_sync/'.format(SSH_USER_HOME)
+    SSL_SYNC_ARCHIVE = os.path.join(SYNC_DIR, 'juju-ssl-sync.tar')
+    SSL_DIR = '{}/juju_ssl/'.format(SNAP_LIB_DIR)
+    PKI_CERTS_DIR = os.path.join(SSL_DIR, 'pki')
+    POLICY_JSON = ('{}/keystone.conf.d/policy.json'
+                   ''.format(SNAP_COMMON_KEYSTONE_DIR))
+    BASE_SERVICES = ['snap.keystone.uwsgi', 'snap.keystone.nginx']
+    APACHE_SSL_DIR = '{}/keystone'.format(SSL_DIR)
+else:
+    APACHE_SSL_DIR = '/etc/apache2/ssl/keystone'
+    KEYSTONE_USER = 'keystone'
+    KEYSTONE_CONF = "/etc/keystone/keystone.conf"
+    KEYSTONE_NGINX_CONF = None
+    KEYSTONE_NGINX_SITE_CONF = None
+    KEYSTONE_LOGGER_CONF = "/etc/keystone/logging.conf"
+    KEYSTONE_CONF_DIR = os.path.dirname(KEYSTONE_CONF)
+    STORED_PASSWD = "/var/lib/keystone/keystone.passwd"
+    STORED_TOKEN = "/var/lib/keystone/keystone.token"
+    STORED_ADMIN_DOMAIN_ID = "/var/lib/keystone/keystone.admin_domain_id"
+    STORED_DEFAULT_DOMAIN_ID = "/var/lib/keystone/keystone.default_domain_id"
+    SERVICE_PASSWD_PATH = '/var/lib/keystone/services.passwd'
+
+    SYNC_FLAGS_DIR = '/var/lib/keystone/juju_sync_flags/'
+    SYNC_DIR = '/var/lib/keystone/juju_sync/'
+    SSL_SYNC_ARCHIVE = os.path.join(SYNC_DIR, 'juju-ssl-sync.tar')
+    SSL_DIR = '/var/lib/keystone/juju_ssl/'
+    PKI_CERTS_DIR = os.path.join(SSL_DIR, 'pki')
+    POLICY_JSON = '/etc/keystone/policy.json'
+    BASE_SERVICES = [
+        'keystone',
+    ]
+
 
 HAPROXY_CONF = '/etc/haproxy/haproxy.cfg'
 APACHE_CONF = '/etc/apache2/sites-available/openstack_https_frontend'
 APACHE_24_CONF = '/etc/apache2/sites-available/openstack_https_frontend.conf'
 
-APACHE_SSL_DIR = '/etc/apache2/ssl/keystone'
-SYNC_FLAGS_DIR = '/var/lib/keystone/juju_sync_flags/'
-SYNC_DIR = '/var/lib/keystone/juju_sync/'
-SSL_SYNC_ARCHIVE = os.path.join(SYNC_DIR, 'juju-ssl-sync.tar')
-SSL_DIR = '/var/lib/keystone/juju_ssl/'
-PKI_CERTS_DIR = os.path.join(SSL_DIR, 'pki')
 SSL_CA_NAME = 'Ubuntu Cloud'
 CLUSTER_RES = 'grp_ks_vips'
-SSH_USER = 'juju_keystone'
 CA_CERT_PATH = '/usr/local/share/ca-certificates/keystone_juju_ca_cert.crt'
 SSL_SYNC_SEMAPHORE = threading.Semaphore()
 SSL_DIRS = [SSL_DIR, APACHE_SSL_DIR, CA_CERT_PATH]
@@ -212,7 +266,6 @@ ADMIN_DOMAIN = 'admin_domain'
 ADMIN_PROJECT = 'admin'
 DEFAULT_DOMAIN = 'default'
 SERVICE_DOMAIN = 'service_domain'
-POLICY_JSON = '/etc/keystone/policy.json'
 TOKEN_FLUSH_CRON_FILE = '/etc/cron.d/keystone-token-flush'
 WSGI_KEYSTONE_API_CONF = '/etc/apache2/sites-enabled/wsgi-openstack-api.conf'
 UNUSED_APACHE_SITE_FILES = ['/etc/apache2/sites-enabled/keystone.conf',
@@ -237,6 +290,28 @@ BASE_RESOURCE_MAP = OrderedDict([
         'contexts': [context.HAProxyContext(singlenode_mode=True),
                      keystone_context.HAProxyContext()],
         'services': ['haproxy'],
+    }),
+    (KEYSTONE_NGINX_CONF, {
+        'services': BASE_SERVICES,
+        'contexts': [keystone_context.KeystoneContext(),
+                     keystone_context.NginxSSLContext(),
+                     context.SharedDBContext(ssl_dir=KEYSTONE_CONF_DIR),
+                     context.PostgresqlDBContext(),
+                     context.SyslogContext(),
+                     keystone_context.HAProxyContext(),
+                     context.BindHostContext(),
+                     context.WorkerConfigContext()],
+    }),
+    (KEYSTONE_NGINX_SITE_CONF, {
+        'services': BASE_SERVICES,
+        'contexts': [keystone_context.KeystoneContext(),
+                     context.SharedDBContext(ssl_dir=KEYSTONE_CONF_DIR),
+                     context.PostgresqlDBContext(),
+                     context.SyslogContext(),
+                     keystone_context.HAProxyContext(),
+                     keystone_context.NginxSSLContext(),
+                     context.BindHostContext(),
+                     context.WorkerConfigContext()],
     }),
     (APACHE_CONF, {
         'contexts': [keystone_context.ApacheSSLContext()],
@@ -439,25 +514,48 @@ def resource_map():
     else:
         resource_map.pop(APACHE_24_CONF)
 
-    if run_in_apache():
+    if snap_install_requested():
+        if APACHE_CONF in resource_map:
+            resource_map.pop(APACHE_CONF)
+        if APACHE_24_CONF in resource_map:
+            resource_map.pop(APACHE_24_CONF)
+    else:
+        if KEYSTONE_NGINX_CONF in resource_map:
+            resource_map.pop(KEYSTONE_NGINX_CONF)
+        if KEYSTONE_NGINX_SITE_CONF in resource_map:
+            resource_map.pop(KEYSTONE_NGINX_SITE_CONF)
+
+    if snap_install_requested():
         for cfile in resource_map:
             svcs = resource_map[cfile]['services']
+            if 'apache2' in svcs:
+                svcs.remove('apache2')
             if 'keystone' in svcs:
                 svcs.remove('keystone')
+            svcs.append('snap.keystone.nginx')
+            svcs.append('snap.keystone.uwsgi')
+
+    if run_in_apache():
+        if not snap_install_requested():
+            for cfile in resource_map:
+                svcs = resource_map[cfile]['services']
+                if 'keystone' in svcs:
+                    svcs.remove('keystone')
                 if 'apache2' not in svcs:
                     svcs.append('apache2')
-        admin_script = os.path.join(git_determine_usr_bin(),
-                                    "keystone-wsgi-admin")
-        public_script = os.path.join(git_determine_usr_bin(),
-                                     "keystone-wsgi-public")
-        resource_map[WSGI_KEYSTONE_API_CONF] = {
-            'contexts': [
-                context.WSGIWorkerConfigContext(name="keystone",
-                                                admin_script=admin_script,
-                                                public_script=public_script),
-                keystone_context.KeystoneContext()],
-            'services': ['apache2']
-        }
+            admin_script = os.path.join(git_determine_usr_bin(),
+                                        "keystone-wsgi-admin")
+            public_script = os.path.join(git_determine_usr_bin(),
+                                         "keystone-wsgi-public")
+            resource_map[WSGI_KEYSTONE_API_CONF] = {
+                'contexts': [
+                    context.WSGIWorkerConfigContext(
+                        name="keystone",
+                        admin_script=admin_script,
+                        public_script=public_script),
+                    keystone_context.KeystoneContext()],
+                'services': ['apache2']
+            }
     return resource_map
 
 
@@ -494,7 +592,8 @@ def run_in_apache():
     """Return true if keystone API is run under apache2 with mod_wsgi in
     this release.
     """
-    return CompareOpenStackReleases(os_release('keystone')) >= 'liberty'
+    return (CompareOpenStackReleases(os_release('keystone')) >= 'liberty' and
+            not snap_install_requested())
 
 
 def disable_unused_apache_sites():
@@ -547,13 +646,16 @@ def api_port(service):
 
 def determine_packages():
     # currently all packages match service names
-    packages = set(services()).union(BASE_PACKAGES)
-    if git_install_requested():
-        packages |= set(BASE_GIT_PACKAGES)
-        packages -= set(GIT_PACKAGE_BLACKLIST)
-    if run_in_apache():
-        packages.add('libapache2-mod-wsgi')
-    return sorted(packages)
+    if snap_install_requested():
+        return sorted(BASE_PACKAGES_SNAP)
+    else:
+        packages = set(services()).union(BASE_PACKAGES)
+        if git_install_requested():
+            packages |= set(BASE_GIT_PACKAGES)
+            packages -= set(GIT_PACKAGE_BLACKLIST)
+        if run_in_apache():
+            packages.add('libapache2-mod-wsgi')
+        return sorted(packages)
 
 
 def save_script_rc():
@@ -577,15 +679,28 @@ def do_openstack_upgrade(configs):
     new_os_rel = get_os_codename_install_source(new_src)
     log('Performing OpenStack upgrade to %s.' % (new_os_rel))
 
-    configure_installation_source(new_src)
-    apt_update()
-
-    dpkg_opts = [
-        '--option', 'Dpkg::Options::=--force-confnew',
-        '--option', 'Dpkg::Options::=--force-confdef',
-    ]
-    apt_upgrade(options=dpkg_opts, fatal=True, dist=True)
-    apt_install(packages=determine_packages(), options=dpkg_opts, fatal=True)
+    if not snap_install_requested():
+        configure_installation_source(new_src)
+        apt_update()
+        dpkg_opts = [
+            '--option', 'Dpkg::Options::=--force-confnew',
+            '--option', 'Dpkg::Options::=--force-confdef',
+        ]
+        apt_upgrade(options=dpkg_opts, fatal=True, dist=True)
+        reset_os_release()
+        apt_install(packages=determine_packages(),
+                    options=dpkg_opts, fatal=True)
+    else:
+        # TODO: Add support for upgrade from deb->snap
+        # NOTE(thedac): Setting devmode until LP#1719636 is fixed
+        install_os_snaps(
+            get_snaps_install_info_from_origin(
+                ['keystone'],
+                new_src,
+                mode='devmode'),
+            refresh=True)
+        post_snap_install()
+        reset_os_release()
 
     # set CONFIGS to load templates from new release and regenerate config
     configs.set_release(openstack_release=new_os_rel)
@@ -623,13 +738,26 @@ def keystone_service():
 def migrate_database():
     """Runs keystone-manage to initialize a new database or migrate existing"""
     log('Migrating the keystone database.', level=INFO)
-    service_stop(keystone_service())
+    if snap_install_requested():
+        service_stop('snap.keystone.*')
+    else:
+        service_stop(keystone_service())
     # NOTE(jamespage) > icehouse creates a log file as root so use
     # sudo to execute as keystone otherwise keystone won't start
     # afterwards.
-    cmd = ['sudo', '-u', 'keystone', 'keystone-manage', 'db_sync']
+
+    # NOTE(coreycb): Can just use keystone-manage when snap has alias support.
+    # Also can run as keystone once snap has drop privs support.
+    if snap_install_requested():
+        cmd = ['/snap/bin/keystone-manage', 'db_sync']
+    else:
+        cmd = ['sudo', '-u', 'keystone', 'keystone-manage', 'db_sync']
     subprocess.check_output(cmd)
-    service_start(keystone_service())
+    if snap_install_requested():
+        service_start('snap.keystone.nginx')
+        service_start('snap.keystone.uwsgi')
+    else:
+        service_start(keystone_service())
     time.sleep(10)
     peer_store('db-initialised', 'True')
 
@@ -644,8 +772,10 @@ def get_local_endpoint(api_suffix=None):
     """Returns the URL for the local end-point bypassing haproxy/ssl"""
     if not api_suffix:
         api_suffix = get_api_suffix()
+
     keystone_port = determine_api_port(api_port('keystone-admin'),
                                        singlenode_mode=True)
+
     if config('prefer-ipv6'):
         ipv6_addr = get_ipv6_addr(exc_list=[config('vip')])[0]
         local_endpoint = 'http://[{}]:{}/{}/'.format(
@@ -887,6 +1017,7 @@ def create_user(name, password, tenant=None, domain=None):
 
 def get_manager(api_version=None):
     """Return a keystonemanager for the correct API version"""
+    set_python_path()
     from manager import get_keystone_manager
     return get_keystone_manager(get_local_endpoint(), get_admin_token(),
                                 api_version)
@@ -1011,10 +1142,23 @@ def get_api_version():
     return api_version
 
 
+def set_python_path():
+    """ Set the Python path to include snap installed python libraries
+
+    The charm itself requires access to the python client. When installed as a
+    snap the client libraries are in /snap/$SNAP/common/lib/python2.7. This
+    function sets the python path to allow clients to be imported from snap
+    installs.
+    """
+    if snap_install_requested():
+        sys.path.append(determine_python_path())
+
+
 def ensure_initial_admin(config):
     # Allow retry on fail since leader may not be ready yet.
     # NOTE(hopem): ks client may not be installed at module import time so we
     # use this wrapped approach instead.
+    set_python_path()
     try:
         from keystoneclient.apiclient.exceptions import InternalServerError
     except:
@@ -1190,10 +1334,10 @@ def ensure_ssl_dirs():
     """Ensure unison has access to these dirs."""
     for path in [SYNC_FLAGS_DIR, SYNC_DIR]:
         if not os.path.isdir(path):
-            mkdir(path, SSH_USER, 'juju_keystone', 0o775)
+            mkdir(path, SSH_USER, KEYSTONE_USER, 0o775)
         else:
-            ensure_permissions(path, user=SSH_USER, group='keystone',
-                               perms=0o755)
+            ensure_permissions(path, user=SSH_USER, group=KEYSTONE_USER,
+                               perms=0o775)
 
 
 def ensure_permissions(path, user=None, group=None, perms=None, recurse=False,
@@ -1291,7 +1435,7 @@ def create_peer_service_actions(action, services):
                                 (local_unit().replace('/', '-'),
                                  service.strip(), action))
         log("Creating action %s" % (flagfile), level=DEBUG)
-        write_file(flagfile, content='', owner=SSH_USER, group='keystone',
+        write_file(flagfile, content='', owner=SSH_USER, group=KEYSTONE_USER,
                    perms=0o744)
 
 
@@ -1300,7 +1444,7 @@ def create_peer_actions(actions):
         action = "%s.%s" % (local_unit().replace('/', '-'), action)
         flagfile = os.path.join(SYNC_FLAGS_DIR, action)
         log("Creating action %s" % (flagfile), level=DEBUG)
-        write_file(flagfile, content='', owner=SSH_USER, group='keystone',
+        write_file(flagfile, content='', owner=SSH_USER, group=KEYSTONE_USER,
                    perms=0o744)
 
 
@@ -1313,7 +1457,7 @@ def unison_sync(paths_to_sync):
     """
     log('Synchronizing CA (%s) to all peers.' % (', '.join(paths_to_sync)),
         level=INFO)
-    keystone_gid = grp.getgrnam('keystone').gr_gid
+    keystone_gid = grp.getgrnam(KEYSTONE_USER).gr_gid
 
     # NOTE(dosaboy): This will sync to all peers who have already provided
     # their ssh keys. If any existing peers have not provided their keys yet,
@@ -1381,14 +1525,20 @@ def is_ssl_cert_master(votes=None):
         return True
 
     # Early in the process and juju leader
-    if not votes:
+    if not set_votes:
         log("This unit is the juju leader and there are no votes yet, "
             "becoming the ssl-cert-master",
             level=DEBUG)
         return True
+    elif (len(set_votes) == 1 and set_votes != set([local_unit()]) and
+            is_leader()):
+        log("This unit is the juju leader but not yet ssl-cert-master "
+            "(current votes = {})".format(set_votes), level=DEBUG)
+        return False
 
     # Should never reach here
-    log("Could not determine the ssl-cert-master. Missing edge case.",
+    log("Could not determine the ssl-cert-master. Missing edge case. "
+        "(current votes = {})".format(set_votes),
         level=ERROR)
     return False
 
@@ -1460,8 +1610,8 @@ def stage_paths_for_sync(paths):
                 log("Path '%s' does not exist - not adding to sync "
                     "tarball" % (path), level=INFO)
 
-    ensure_permissions(SYNC_DIR, user=SSH_USER, group='keystone',
-                       perms=0o755, recurse=True)
+    ensure_permissions(SYNC_DIR, user=SSH_USER, group=KEYSTONE_USER,
+                       perms=0o775, recurse=True)
 
 
 def is_pki_enabled():
@@ -1479,20 +1629,21 @@ def ensure_pki_cert_paths():
                   if not os.path.exists(p)]
     if not_exists:
         log("Configuring token signing cert paths", level=DEBUG)
-        perms = 0o755
+        perms = 0o775
         for path in not_exists:
             if not os.path.isdir(path):
-                mkdir(path=path, owner=SSH_USER, group='keystone', perms=perms)
+                mkdir(path=path, owner=SSH_USER, group=KEYSTONE_USER,
+                      perms=perms)
             else:
                 # Ensure accessible by ssh user and group (for sync).
-                ensure_permissions(path, user=SSH_USER, group='keystone',
+                ensure_permissions(path, user=SSH_USER, group=KEYSTONE_USER,
                                    perms=perms)
 
 
 def ensure_pki_dir_permissions():
     # Ensure accessible by unison user and group (for sync).
-    ensure_permissions(PKI_CERTS_DIR, user=SSH_USER, group='keystone',
-                       perms=0o755, recurse=True)
+    ensure_permissions(PKI_CERTS_DIR, user=SSH_USER, group=KEYSTONE_USER,
+                       perms=0o775, recurse=True)
 
 
 def update_certs_if_available(f):
@@ -1509,7 +1660,8 @@ def update_certs_if_available(f):
                 fd.extractall(path='/')
 
             for syncfile in files:
-                ensure_permissions(syncfile, user='keystone', group='keystone',
+                ensure_permissions(syncfile, user=KEYSTONE_USER,
+                                   group=KEYSTONE_USER,
                                    perms=0o744, recurse=True)
 
             # Mark as complete
@@ -1570,10 +1722,14 @@ def synchronize_ca(fatal=False):
         return {}
 
     if not os.path.isdir(SYNC_FLAGS_DIR):
-        mkdir(SYNC_FLAGS_DIR, SSH_USER, 'keystone', 0o775)
+        mkdir(SYNC_FLAGS_DIR, SSH_USER, KEYSTONE_USER, 0o775)
 
+    restart_trigger = None
     for action, services in peer_service_actions.iteritems():
-        create_peer_service_actions(action, set(services))
+        services = set(services)
+        if services:
+            restart_trigger = str(uuid.uuid4())
+            create_peer_service_actions(action, services)
 
     create_peer_actions(peer_actions)
 
@@ -1591,13 +1747,23 @@ def synchronize_ca(fatal=False):
     if synced_units:
         # Format here needs to match that used when peers request sync
         synced_units = [u.replace('/', '-') for u in synced_units]
-        cluster_rel_settings['ssl-synced-units'] = \
+        ssl_synced_units = \
             json.dumps(synced_units)
+        # NOTE(hopem): we pull this onto the leader settings to avoid
+        # unnecessary cluster relation noise. This is possible because the
+        # setting is only needed by the cert master.
+        if 'ssl-synced-units' not in leader_get():
+            rid = relation_ids('cluster')[0]
+            relation_set_and_migrate_to_leader(relation_id=rid,
+                                               **{'ssl-synced-units':
+                                                  ssl_synced_units})
+        else:
+            leader_set({'ssl-synced-units': ssl_synced_units})
 
-    trigger = str(uuid.uuid4())
-    log("Sending restart-services-trigger=%s to all peers" % (trigger),
-        level=DEBUG)
-    cluster_rel_settings['restart-services-trigger'] = trigger
+    if restart_trigger:
+        log("Sending restart-services-trigger=%s to all peers" %
+            (restart_trigger), level=DEBUG)
+        cluster_rel_settings['restart-services-trigger'] = restart_trigger
 
     log("Sync complete", level=DEBUG)
     return cluster_rel_settings
@@ -1611,8 +1777,11 @@ def clear_ssl_synced_units():
     """
     log("Clearing ssl sync units", level=DEBUG)
     for rid in relation_ids('cluster'):
-        relation_set(relation_id=rid,
-                     relation_settings={'ssl-synced-units': None})
+        if 'ssl-synced-units' not in leader_get():
+            relation_set_and_migrate_to_leader(relation_id=rid,
+                                               **{'ssl-synced-units': None})
+        else:
+            leader_set({'ssl-synced-units': None})
 
 
 def update_hash_from_path(hash, path, recurse_depth=10):
@@ -1678,13 +1847,17 @@ def synchronize_ca_if_changed(force=False, fatal=False):
 
                 # If we are the sync master but not leader, ensure we have
                 # relinquished master status.
-                if not is_elected_leader(CLUSTER_RES):
-                    log("Re-electing ssl cert master.", level=INFO)
-                    peer_settings['ssl-cert-master'] = 'unknown'
+                cluster_rids = relation_ids('cluster')
+                if cluster_rids:
+                    master = relation_get('ssl-cert-master',
+                                          rid=cluster_rids[0],
+                                          unit=local_unit())
+                    if not is_leader() and master == local_unit():
+                        log("Re-electing ssl cert master.", level=INFO)
+                        peer_settings['ssl-cert-master'] = 'unknown'
 
-                if peer_settings:
-                    for rid in relation_ids('cluster'):
-                        relation_set(relation_id=rid,
+                    if peer_settings:
+                        relation_set(relation_id=cluster_rids[0],
                                      relation_settings=peer_settings)
 
                 return ret
@@ -1708,15 +1881,17 @@ def force_ssl_sync():
 
 def ensure_ssl_dir():
     """Ensure juju ssl dir exists and is unsion read/writable."""
-    perms = 0o755
+    # NOTE(thedac) Snap service restarts will override permissions
+    # in SNAP_LIB_DIR including SSL_DIR
+    perms = 0o775
     if not os.path.isdir(SSL_DIR):
-        mkdir(SSL_DIR, SSH_USER, 'keystone', perms)
+        mkdir(SSL_DIR, SSH_USER, KEYSTONE_USER, perms)
     else:
-        ensure_permissions(SSL_DIR, user=SSH_USER, group='keystone',
+        ensure_permissions(SSL_DIR, user=SSH_USER, group=KEYSTONE_USER,
                            perms=perms)
 
 
-def get_ca(user='keystone', group='keystone'):
+def get_ca(user=KEYSTONE_USER, group=KEYSTONE_USER):
     """Initialize a new CA object if one hasn't already been loaded.
 
     This will create a new CA or load an existing one.
@@ -2066,6 +2241,8 @@ def add_credentials_to_keystone(relation_id=None, remote_unit=None):
         "api_version": get_api_version(),
         "region": config('region')
     }
+    if domain:
+        relation_data['domain'] = domain
     # Get and pass CA bundle settings
     relation_data.update(get_ssl_ca_settings())
 
@@ -2271,7 +2448,6 @@ def is_db_ready(use_current_context=False, db_rel=None):
 
 def determine_usr_bin():
     """Return the /usr/bin path for Apache2 vhost config.
-
     The /usr/bin path will be located in the virtualenv if the charm
     is configured to deploy keystone from source.
     """
@@ -2284,16 +2460,20 @@ def determine_usr_bin():
 
 
 def determine_python_path():
-    """Return the python-path for Apache2 vhost config.
+    """Return the python-path
 
-    Returns None unless the charm is configured to deploy keystone from source,
-    in which case the path of the virtualenv's site-packages is returned.
+    Determine if git or snap installed and return the appropriate python path.
+    Returns None unless the charm if neither condition is true.
+
+    :returns: string python path or None
     """
-    if git_install_requested():
+    _python_path = 'lib/python2.7/site-packages'
+    if snap_install_requested():
+        return os.path.join(SNAP_BASE_DIR, _python_path)
+    elif git_install_requested():
         projects_yaml = config('openstack-origin-git')
         projects_yaml = git_default_repos(projects_yaml)
-        return os.path.join(git_pip_venv_dir(projects_yaml),
-                            'lib/python2.7/site-packages')
+        return os.path.join(git_pip_venv_dir(projects_yaml), _python_path)
     else:
         return None
 
@@ -2325,10 +2505,12 @@ def git_pre_install():
     add_user_to_group('keystone', 'keystone')
 
     for d in dirs:
-        mkdir(d, owner='keystone', group='keystone', perms=0o755, force=False)
+        mkdir(d, owner=KEYSTONE_USER, group=KEYSTONE_USER, perms=0o755,
+              force=False)
 
     for l in logs:
-        write_file(l, '', owner='keystone', group='keystone', perms=0o600)
+        write_file(l, '', owner=KEYSTONE_USER, group=KEYSTONE_USER,
+                   perms=0o600)
 
 
 def git_post_install(projects_yaml):
@@ -2377,9 +2559,9 @@ def git_post_install(projects_yaml):
             'process_name': 'keystone',
             'executable_name': os.path.join(bin_dir, 'keystone-all'),
             'config_files': ['/etc/keystone/keystone.conf'],
-            'log_file': '/var/log/keystone/keystone.log',
         }
 
+        keystone_context['log_file'] = '/var/log/keystone/keystone.log'
         templates_dir = 'hooks/charmhelpers/contrib/openstack/templates'
         templates_dir = os.path.join(charm_dir(), templates_dir)
         render('git.upstart', '/etc/init/keystone.conf', keystone_context,
@@ -2507,3 +2689,16 @@ def _pause_resume_helper(f, configs):
     f(assess_status_func(configs),
       services=services(),
       ports=determine_ports())
+
+
+def post_snap_install():
+    """ Specific steps post snap install for this charm
+
+    """
+    log("Perfoming post snap install tasks", INFO)
+    PASTE_SRC = ('{}/etc/keystone/keystone-paste.ini'
+                 ''.format(SNAP_BASE_DIR))
+    PASTE_DST = '{}/keystone-paste.ini'.format(SNAP_COMMON_KEYSTONE_DIR)
+    if os.path.exists(PASTE_SRC):
+        log("Perfoming post snap install tasks", INFO)
+        shutil.copy(PASTE_SRC, PASTE_DST)
