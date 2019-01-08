@@ -20,7 +20,7 @@ os.environ['JUJU_UNIT_NAME'] = 'keystone'
 with patch('charmhelpers.contrib.openstack.utils'
            '.snap_install_requested') as snap_install_requested:
     snap_install_requested.return_value = False
-    import openstack_upgrade
+    import openstack_upgrade as openstack_upgrade
 
 from test_utils import (
     CharmTestCase
@@ -46,11 +46,9 @@ class TestKeystoneUpgradeActions(CharmTestCase):
     @patch.object(openstack_upgrade, 'register_configs')
     @patch('charmhelpers.contrib.openstack.utils.config')
     @patch('charmhelpers.contrib.openstack.utils.action_set')
-    @patch('charmhelpers.contrib.openstack.utils.git_install_requested')
     @patch('charmhelpers.contrib.openstack.utils.openstack_upgrade_available')
-    def test_openstack_upgrade_true(self, upgrade_avail, git_requested,
+    def test_openstack_upgrade_true(self, upgrade_avail,
                                     action_set, config, reg_configs):
-        git_requested.return_value = False
         upgrade_avail.return_value = True
         config.return_value = True
 
@@ -63,11 +61,9 @@ class TestKeystoneUpgradeActions(CharmTestCase):
     @patch.object(openstack_upgrade, 'register_configs')
     @patch('charmhelpers.contrib.openstack.utils.config')
     @patch('charmhelpers.contrib.openstack.utils.action_set')
-    @patch('charmhelpers.contrib.openstack.utils.git_install_requested')
     @patch('charmhelpers.contrib.openstack.utils.openstack_upgrade_available')
-    def test_openstack_upgrade_false(self, upgrade_avail, git_requested,
+    def test_openstack_upgrade_false(self, upgrade_avail,
                                      action_set, config, reg_configs):
-        git_requested.return_value = False
         upgrade_avail.return_value = True
         config.return_value = False
 

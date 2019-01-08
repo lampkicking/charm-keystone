@@ -30,6 +30,7 @@ import yaml
 
 from charmhelpers.core.hookenv import (
     config,
+    hook_name,
     local_unit,
     log,
     relation_ids,
@@ -285,7 +286,7 @@ class NRPE(object):
         try:
             nagios_uid = pwd.getpwnam('nagios').pw_uid
             nagios_gid = grp.getgrnam('nagios').gr_gid
-        except:
+        except Exception:
             log("Nagios user not set up, nrpe checks not updated")
             return
 
@@ -302,7 +303,12 @@ class NRPE(object):
                 "command": nrpecheck.command,
             }
 
-        service('restart', 'nagios-nrpe-server')
+        # update-status hooks are configured to firing every 5 minutes by
+        # default. When nagios-nrpe-server is restarted, the nagios server
+        # reports checks failing causing unneccessary alerts. Let's not restart
+        # on update-status hooks.
+        if not hook_name() == 'update-status':
+            service('restart', 'nagios-nrpe-server')
 
         monitor_ids = relation_ids("local-monitors") + \
             relation_ids("nrpe-external-master")
@@ -404,16 +410,26 @@ def add_init_service_checks(nrpe, services, unit_name, immediate_check=True):
                 os.chmod(checkpath, 0o644)
 
 
-def copy_nrpe_checks():
+def copy_nrpe_checks(nrpe_files_dir=None):
     """
     Copy the nrpe checks into place
 
     """
     NAGIOS_PLUGINS = '/usr/local/lib/nagios/plugins'
-    nrpe_files_dir = os.path.join(os.getenv('CHARM_DIR'), 'hooks',
-                                  'charmhelpers', 'contrib', 'openstack',
-                                  'files')
-
+    if nrpe_files_dir is None:
+        # determine if "charmhelpers" is in CHARMDIR or CHARMDIR/hooks
+        for segment in ['.', 'hooks']:
+            nrpe_files_dir = os.path.abspath(os.path.join(
+                os.getenv('CHARM_DIR'),
+                segment,
+                'charmhelpers',
+                'contrib',
+                'openstack',
+                'files'))
+            if os.path.isdir(nrpe_files_dir):
+                break
+        else:
+            raise RuntimeError("Couldn't find charmhelpers directory")
     if not os.path.exists(NAGIOS_PLUGINS):
         os.makedirs(NAGIOS_PLUGINS)
     for fname in glob.glob(os.path.join(nrpe_files_dir, "check_*")):

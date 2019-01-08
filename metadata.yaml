@@ -11,8 +11,8 @@ tags:
   - misc
 series:
   - xenial
-  - artful
-  - zesty
+  - bionic
+  - cosmic
   - trusty
 extra-bindings:
   public:
@@ -33,14 +33,19 @@ provides:
 requires:
   shared-db:
     interface: mysql-shared
-  pgsql-db:
-    interface: pgsql
   ha:
     interface: hacluster
     scope: container
   domain-backend:
     interface: keystone-domain-backend
     scope: container
+  keystone-fid-service-provider:
+    interface: keystone-fid-service-provider
+    scope: container
+  websso-trusted-dashboard:
+    interface: websso-trusted-dashboard
+  certificates:
+    interface: tls-certificates
 peers:
   cluster:
     interface: keystone-ha

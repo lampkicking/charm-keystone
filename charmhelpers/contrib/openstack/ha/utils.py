@@ -23,9 +23,13 @@
 Helpers for high availability.
 """
 
+import hashlib
+import json
+
 import re
 
 from charmhelpers.core.hookenv import (
+    expected_related_units,
     log,
     relation_set,
     charm_name,
@@ -40,6 +44,23 @@ from charmhelpers.core.host import (
 
 from charmhelpers.contrib.openstack.ip import (
     resolve_address,
+    is_ipv6,
+)
+
+from charmhelpers.contrib.network.ip import (
+    get_iface_for_address,
+    get_netmask_for_address,
+)
+
+from charmhelpers.contrib.hahelpers.cluster import (
+    get_hacluster_config
+)
+
+JSON_ENCODE_OPTIONS = dict(
+    sort_keys=True,
+    allow_nan=False,
+    indent=None,
+    separators=(',', ':'),
 )
 
 
@@ -53,8 +74,8 @@ class DNSHAException(Exception):
 def update_dns_ha_resource_params(resources, resource_params,
                                   relation_id=None,
                                   crm_ocf='ocf:maas:dns'):
-    """ Check for os-*-hostname settings and update resource dictionaries for
-    the HA relation.
+    """ Configure DNS-HA resources based on provided configuration and
+    update resource dictionaries for the HA relation.
 
     @param resources: Pointer to dictionary of resources.
                       Usually instantiated in ha_joined().
@@ -64,7 +85,113 @@ def update_dns_ha_resource_params(resources, resource_params,
     @param crm_ocf: Corosync Open Cluster Framework resource agent to use for
                     DNS HA
     """
+    _relation_data = {'resources': {}, 'resource_params': {}}
+    update_hacluster_dns_ha(charm_name(),
+                            _relation_data,
+                            crm_ocf)
+    resources.update(_relation_data['resources'])
+    resource_params.update(_relation_data['resource_params'])
+    relation_set(relation_id=relation_id, groups=_relation_data['groups'])
 
+
+def assert_charm_supports_dns_ha():
+    """Validate prerequisites for DNS HA
+    The MAAS client is only available on Xenial or greater
+
+    :raises DNSHAException: if release is < 16.04
+    """
+    if lsb_release().get('DISTRIB_RELEASE') < '16.04':
+        msg = ('DNS HA is only supported on 16.04 and greater '
+               'versions of Ubuntu.')
+        status_set('blocked', msg)
+        raise DNSHAException(msg)
+    return True
+
+
+def expect_ha():
+    """ Determine if the unit expects to be in HA
+
+    Check juju goal-state if ha relation is expected, check for VIP or dns-ha
+    settings which indicate the unit should expect to be related to hacluster.
+
+    @returns boolean
+    """
+    ha_related_units = []
+    try:
+        ha_related_units = list(expected_related_units(reltype='ha'))
+    except (NotImplementedError, KeyError):
+        pass
+    return len(ha_related_units) > 0 or config('vip') or config('dns-ha')
+
+
+def generate_ha_relation_data(service, extra_settings=None):
+    """ Generate relation data for ha relation
+
+    Based on configuration options and unit interfaces, generate a json
+    encoded dict of relation data items for the hacluster relation,
+    providing configuration for DNS HA or VIP's + haproxy clone sets.
+
+    Example of supplying additional settings::
+
+        COLO_CONSOLEAUTH = 'inf: res_nova_consoleauth grp_nova_vips'
+        AGENT_CONSOLEAUTH = 'ocf:openstack:nova-consoleauth'
+        AGENT_CA_PARAMS = 'op monitor interval="5s"'
+
+        ha_console_settings = {
+            'colocations': {'vip_consoleauth': COLO_CONSOLEAUTH},
+            'init_services': {'res_nova_consoleauth': 'nova-consoleauth'},
+            'resources': {'res_nova_consoleauth': AGENT_CONSOLEAUTH},
+            'resource_params': {'res_nova_consoleauth': AGENT_CA_PARAMS})
+        generate_ha_relation_data('nova', extra_settings=ha_console_settings)
+
+
+    @param service: Name of the service being configured
+    @param extra_settings: Dict of additional resource data
+    @returns dict: json encoded data for use with relation_set
+    """
+    _haproxy_res = 'res_{}_haproxy'.format(service)
+    _relation_data = {
+        'resources': {
+            _haproxy_res: 'lsb:haproxy',
+        },
+        'resource_params': {
+            _haproxy_res: 'op monitor interval="5s"'
+        },
+        'init_services': {
+            _haproxy_res: 'haproxy'
+        },
+        'clones': {
+            'cl_{}_haproxy'.format(service): _haproxy_res
+        },
+    }
+
+    if extra_settings:
+        for k, v in extra_settings.items():
+            if _relation_data.get(k):
+                _relation_data[k].update(v)
+            else:
+                _relation_data[k] = v
+
+    if config('dns-ha'):
+        update_hacluster_dns_ha(service, _relation_data)
+    else:
+        update_hacluster_vip(service, _relation_data)
+
+    return {
+        'json_{}'.format(k): json.dumps(v, **JSON_ENCODE_OPTIONS)
+        for k, v in _relation_data.items() if v
+    }
+
+
+def update_hacluster_dns_ha(service, relation_data,
+                            crm_ocf='ocf:maas:dns'):
+    """ Configure DNS-HA resources based on provided configuration
+
+    @param service: Name of the service being configured
+    @param relation_data: Pointer to dictionary of relation data.
+    @param crm_ocf: Corosync Open Cluster Framework resource agent to use for
+                    DNS HA
+    """
     # Validate the charm environment for DNS HA
     assert_charm_supports_dns_ha()
 
@@ -93,7 +220,7 @@ def update_dns_ha_resource_params(resources, resource_params,
             status_set('blocked', msg)
             raise DNSHAException(msg)
 
-        hostname_key = 'res_{}_{}_hostname'.format(charm_name(), endpoint_type)
+        hostname_key = 'res_{}_{}_hostname'.format(service, endpoint_type)
         if hostname_key in hostname_group:
             log('DNS HA: Resource {}: {} already exists in '
                 'hostname group - skipping'.format(hostname_key, hostname),
@@ -101,42 +228,95 @@ def update_dns_ha_resource_params(resources, resource_params,
             continue
 
         hostname_group.append(hostname_key)
-        resources[hostname_key] = crm_ocf
-        resource_params[hostname_key] = (
-            'params fqdn="{}" ip_address="{}" '
-            ''.format(hostname, resolve_address(endpoint_type=endpoint_type,
-                                                override=False)))
+        relation_data['resources'][hostname_key] = crm_ocf
+        relation_data['resource_params'][hostname_key] = (
+            'params fqdn="{}" ip_address="{}"'
+            .format(hostname, resolve_address(endpoint_type=endpoint_type,
+                                              override=False)))
 
     if len(hostname_group) >= 1:
         log('DNS HA: Hostname group is set with {} as members. '
             'Informing the ha relation'.format(' '.join(hostname_group)),
             DEBUG)
-        relation_set(relation_id=relation_id, groups={
-            'grp_{}_hostnames'.format(charm_name()): ' '.join(hostname_group)})
+        relation_data['groups'] = {
+            'grp_{}_hostnames'.format(service): ' '.join(hostname_group)
+        }
     else:
         msg = 'DNS HA: Hostname group has no members.'
         status_set('blocked', msg)
         raise DNSHAException(msg)
 
 
-def assert_charm_supports_dns_ha():
-    """Validate prerequisites for DNS HA
-    The MAAS client is only available on Xenial or greater
+def update_hacluster_vip(service, relation_data):
+    """ Configure VIP resources based on provided configuration
+
+    @param service: Name of the service being configured
+    @param relation_data: Pointer to dictionary of relation data.
     """
-    if lsb_release().get('DISTRIB_RELEASE') < '16.04':
-        msg = ('DNS HA is only supported on 16.04 and greater '
-               'versions of Ubuntu.')
-        status_set('blocked', msg)
-        raise DNSHAException(msg)
-    return True
+    cluster_config = get_hacluster_config()
+    vip_group = []
+    vips_to_delete = []
+    for vip in cluster_config['vip'].split():
+        if is_ipv6(vip):
+            res_vip = 'ocf:heartbeat:IPv6addr'
+            vip_params = 'ipv6addr'
+        else:
+            res_vip = 'ocf:heartbeat:IPaddr2'
+            vip_params = 'ip'
 
+        iface = get_iface_for_address(vip)
+        netmask = get_netmask_for_address(vip)
 
-def expect_ha():
-    """ Determine if the unit expects to be in HA
+        fallback_params = False
+        if iface is None:
+            iface = config('vip_iface')
+            fallback_params = True
+        if netmask is None:
+            netmask = config('vip_cidr')
+            fallback_params = True
 
-    Check for VIP or dns-ha settings which indicate the unit should expect to
-    be related to hacluster.
+        if iface is not None:
+            # NOTE(jamespage): Delete old VIP resources
+            # Old style naming encoding iface in name
+            # does not work well in environments where
+            # interface/subnet wiring is not consistent
+            vip_key = 'res_{}_{}_vip'.format(service, iface)
+            if vip_key in vips_to_delete:
+                vip_key = '{}_{}'.format(vip_key, vip_params)
+            vips_to_delete.append(vip_key)
 
-    @returns boolean
-    """
-    return config('vip') or config('dns-ha')
+            vip_key = 'res_{}_{}_vip'.format(
+                service,
+                hashlib.sha1(vip.encode('UTF-8')).hexdigest()[:7])
+
+            relation_data['resources'][vip_key] = res_vip
+            # NOTE(jamespage):
+            # Use option provided vip params if these where used
+            # instead of auto-detected values
+            if fallback_params:
+                relation_data['resource_params'][vip_key] = (
+                    'params {ip}="{vip}" cidr_netmask="{netmask}" '
+                    'nic="{iface}"'.format(ip=vip_params,
+                                           vip=vip,
+                                           iface=iface,
+                                           netmask=netmask)
+                )
+            else:
+                # NOTE(jamespage):
+                # let heartbeat figure out which interface and
+                # netmask to configure, which works nicely
+                # when network interface naming is not
+                # consistent across units.
+                relation_data['resource_params'][vip_key] = (
+                    'params {ip}="{vip}"'.format(ip=vip_params,
+                                                 vip=vip))
+
+            vip_group.append(vip_key)
+
+    if vips_to_delete:
+        relation_data['delete_resources'] = vips_to_delete
+
+    if len(vip_group) >= 1:
+        relation_data['groups'] = {
+            'grp_{}_vips'.format(service): ' '.join(vip_group)
+        }

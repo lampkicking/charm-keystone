@@ -12,25 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from mock import patch, call, MagicMock
-from test_utils import CharmTestCase
+import builtins
+import collections
+from mock import patch, call, MagicMock, mock_open, Mock
+import json
 import os
-from base64 import b64encode
 import subprocess
+import time
+
+from test_utils import CharmTestCase
 
 os.environ['JUJU_UNIT_NAME'] = 'keystone'
 with patch('charmhelpers.core.hookenv.config') as config, \
         patch('charmhelpers.contrib.openstack.'
-              'utils.snap_install_requested') as snap_install_requested:
-    snap_install_requested.return_value = False
+              'utils.snap_install_requested',
+              Mock(return_value=False)):
+    import importlib
     import keystone_utils as utils
+    # we have to force utils to reload as another test module may already have
+    # pulled it in, and thus all this fancy patching will just fail
+    importlib.reload(utils)
 
 TO_PATCH = [
     'api_port',
     'config',
     'os_release',
     'log',
-    'get_ca',
     'create_role',
     'create_service_entry',
     'create_endpoint_template',
@@ -39,17 +46,11 @@ TO_PATCH = [
     'get_requested_roles',
     'get_service_password',
     'get_os_codename_install_source',
-    'git_clone_and_install',
-    'git_pip_venv_dir',
-    'git_src_dir',
     'grant_role',
     'configure_installation_source',
-    'is_elected_leader',
-    'is_ssl_cert_master',
     'https',
     'lsb_release',
     'peer_store_and_set',
-    'service_restart',
     'service_stop',
     'service_start',
     'snap_install_requested',
@@ -57,12 +58,11 @@ TO_PATCH = [
     'relation_set',
     'relation_ids',
     'relation_id',
-    'render',
     'local_unit',
     'related_units',
     'https',
-    'peer_store',
-    'pip_install',
+    'mkdir',
+    'write_file',
     # generic
     'apt_update',
     'apt_upgrade',
@@ -71,18 +71,8 @@ TO_PATCH = [
     'time',
     'pwgen',
     'os_application_version_set',
-    'is_leader',
     'reset_os_release',
 ]
-
-openstack_origin_git = \
-    """repositories:
-         - {name: requirements,
-            repository: 'git://git.openstack.org/openstack/requirements',
-            branch: stable/juno}
-         - {name: keystone,
-            repository: 'git://git.openstack.org/openstack/keystone',
-            branch: stable/juno}"""
 
 
 class TestKeystoneUtils(CharmTestCase):
@@ -107,6 +97,7 @@ class TestKeystoneUtils(CharmTestCase):
                 'contexts': [self.ctxt],
             }
         }
+        self.get_os_codename_install_source.return_value = 'icehouse'
 
     @patch('charmhelpers.contrib.openstack.templating.OSConfigRenderer')
     @patch('os.path.exists')
@@ -132,29 +123,23 @@ class TestKeystoneUtils(CharmTestCase):
                 '/etc/apache2/sites-available/openstack_https_frontend.conf',
                 [self.ctxt]),
         ]
-        self.assertEqual(fake_renderer.register.call_args_list, ex_reg)
+        fake_renderer.register.assert_has_calls(ex_reg, any_order=True)
 
-    @patch.object(utils, 'git_determine_usr_bin')
     @patch.object(utils, 'snap_install_requested')
     @patch.object(utils, 'os')
     def test_resource_map_enable_memcache_mitaka(self, mock_os,
-                                                 snap_install_requested,
-                                                 git_determine_usr_bin):
+                                                 snap_install_requested):
         self.os_release.return_value = 'mitaka'
         snap_install_requested.return_value = False
-        git_determine_usr_bin.return_value = '/usr/bin'
         mock_os.path.exists.return_value = True
         self.assertTrue('/etc/memcached.conf' in utils.resource_map().keys())
 
-    @patch.object(utils, 'git_determine_usr_bin')
     @patch.object(utils, 'snap_install_requested')
     @patch.object(utils, 'os')
     def test_resource_map_enable_memcache_liberty(self, mock_os,
-                                                  snap_install_requested,
-                                                  git_determine_usr_bin):
+                                                  snap_install_requested):
         self.os_release.return_value = 'liberty'
         snap_install_requested.return_value = False
-        git_determine_usr_bin.return_value = '/usr/bin'
         mock_os.path.exists.return_value = True
         self.assertFalse('/etc/memcached.conf' in utils.resource_map().keys())
 
@@ -174,24 +159,26 @@ class TestKeystoneUtils(CharmTestCase):
         self.assertEqual(set(ex), set(result))
 
     @patch('charmhelpers.contrib.openstack.utils.config')
-    def test_determine_packages_mitaka(self, _config):
-        self.os_release.return_value = 'mitaka'
+    def test_determine_packages_queens(self, _config):
+        self.os_release.return_value = 'queens'
         self.snap_install_requested.return_value = False
         _config.return_value = None
         result = utils.determine_packages()
         ex = utils.BASE_PACKAGES + [
-            'keystone', 'python-keystoneclient', 'libapache2-mod-wsgi',
-            'memcached']
+            'keystone', 'python-keystoneclient', 'memcached',
+            'libapache2-mod-wsgi'
+        ]
         self.assertEqual(set(ex), set(result))
 
     @patch('charmhelpers.contrib.openstack.utils.config')
-    def test_determine_packages_git(self, _config):
-        self.os_release.return_value = 'havana'
-        _config.return_value = openstack_origin_git
+    def test_determine_packages_rocky(self, _config):
+        self.os_release.return_value = 'rocky'
+        self.snap_install_requested.return_value = False
+        _config.return_value = None
         result = utils.determine_packages()
-        ex = utils.BASE_PACKAGES + utils.BASE_GIT_PACKAGES
-        for p in utils.GIT_PACKAGE_BLACKLIST:
-            ex.remove(p)
+        ex = list(set(
+            [p for p in utils.BASE_PACKAGES if not p.startswith('python-')] +
+            ['memcached'] + utils.PY3_PACKAGES))
         self.assertEqual(set(ex), set(result))
 
     @patch('charmhelpers.contrib.openstack.utils.config')
@@ -203,6 +190,20 @@ class TestKeystoneUtils(CharmTestCase):
         ex = utils.BASE_PACKAGES_SNAP + ['memcached']
         self.assertEqual(set(ex), set(result))
 
+    def test_determine_purge_packages(self):
+        'Ensure no packages are identified for purge prior to rocky'
+        self.os_release.return_value = 'queens'
+        self.assertEqual(utils.determine_purge_packages(), [])
+
+    def test_determine_purge_packages_rocky(self):
+        'Ensure python packages are identified for purge at rocky'
+        self.os_release.return_value = 'rocky'
+        self.assertEqual(utils.determine_purge_packages(),
+                         [p for p in utils.BASE_PACKAGES
+                          if p.startswith('python-')] +
+                         ['python-keystone', 'python-memcache'])
+
+    @patch.object(utils, 'is_elected_leader')
     @patch.object(utils, 'disable_unused_apache_sites')
     @patch('os.path.exists')
     @patch.object(utils, 'run_in_apache')
@@ -210,11 +211,12 @@ class TestKeystoneUtils(CharmTestCase):
     @patch.object(utils, 'migrate_database')
     def test_openstack_upgrade_leader(
             self, migrate_database, determine_packages,
-            run_in_apache, os_path_exists, disable_unused_apache_sites):
+            run_in_apache, os_path_exists, disable_unused_apache_sites,
+            mock_is_elected_leader):
         configs = MagicMock()
         self.test_config.set('openstack-origin', 'cloud:xenial-newton')
+        self.os_release.return_value = 'ocata'
         determine_packages.return_value = []
-        self.is_elected_leader.return_value = True
         os_path_exists.return_value = True
         run_in_apache.return_value = True
 
@@ -247,7 +249,23 @@ class TestKeystoneUtils(CharmTestCase):
         disable_unused_apache_sites.assert_called_with()
         self.reset_os_release.assert_called()
 
-    def test_migrate_database(self):
+    @patch.object(utils, 'leader_get')
+    def test_is_db_initialised_true_string(self, _leader_get):
+        _leader_get.return_value = "True"
+        self.assertTrue(utils.is_db_initialised())
+
+    @patch.object(utils, 'leader_get')
+    def test_is_db_initialised_true_bool(self, _leader_get):
+        _leader_get.return_value = True
+        self.assertTrue(utils.is_db_initialised())
+
+    @patch.object(utils, 'leader_get')
+    def test_is_db_initialised_not_set(self, _leader_get):
+        _leader_get.return_value = None
+        self.assertFalse(utils.is_db_initialised())
+
+    @patch.object(utils, 'leader_set')
+    def test_migrate_database(self, _leader_set):
         self.os_release.return_value = 'havana'
         utils.migrate_database()
 
@@ -255,14 +273,14 @@ class TestKeystoneUtils(CharmTestCase):
         cmd = ['sudo', '-u', 'keystone', 'keystone-manage', 'db_sync']
         self.subprocess.check_output.assert_called_with(cmd)
         self.service_start.assert_called_with('keystone')
+        _leader_set.assert_called_with({'db-initialised': True})
 
     @patch.object(utils, 'leader_get')
     @patch.object(utils, 'get_api_version')
     @patch.object(utils, 'get_manager')
     @patch.object(utils, 'resolve_address')
-    @patch.object(utils, 'b64encode')
     def test_add_service_to_keystone_clustered_https_none_values(
-            self, b64encode, _resolve_address, _get_manager,
+            self, _resolve_address, _get_manager,
             _get_api_version, _leader_get):
         _get_api_version.return_value = 2
         _leader_get.return_value = None
@@ -270,11 +288,9 @@ class TestKeystoneUtils(CharmTestCase):
         remote_unit = 'unit/0'
         _resolve_address.return_value = '10.10.10.10'
         self.https.return_value = True
-        self.test_config.set('https-service-endpoints', 'True')
         self.test_config.set('vip', '10.10.10.10')
         self.test_config.set('admin-port', 80)
         self.test_config.set('service-port', 81)
-        b64encode.return_value = 'certificate'
         self.get_requested_roles.return_value = ['role1', ]
 
         self.relation_get.return_value = {'service': 'keystone',
@@ -291,18 +307,17 @@ class TestKeystoneUtils(CharmTestCase):
 
         relation_data = {'auth_host': '10.10.10.10',
                          'service_host': '10.10.10.10',
-                         'auth_protocol': 'https',
                          'service_protocol': 'https',
                          'auth_port': 80,
+                         'auth_protocol': 'https',
                          'service_port': 81,
-                         'https_keystone': 'True',
-                         'ca_cert': 'certificate',
                          'region': 'RegionOne',
                          'api_version': 2,
                          'admin_domain_id': None}
         self.peer_store_and_set.assert_called_with(relation_id=relation_id,
                                                    **relation_data)
 
+    @patch.object(utils, 'leader_set')
     @patch.object(utils, 'leader_get')
     @patch.object(utils, 'get_api_version')
     @patch.object(utils, 'create_user')
@@ -313,7 +328,7 @@ class TestKeystoneUtils(CharmTestCase):
     def test_add_service_to_keystone_no_clustered_no_https_complete_values(
             self, KeystoneManager, add_endpoint, ensure_valid_service,
             _resolve_address, create_user, get_api_version, leader_get,
-            test_api_version=2):
+            leader_set, test_api_version=2):
         get_api_version.return_value = test_api_version
         leader_get.return_value = None
         relation_id = 'identity-service:0'
@@ -327,17 +342,19 @@ class TestKeystoneUtils(CharmTestCase):
         self.test_config.set('admin-port', 80)
         self.test_config.set('service-port', 81)
         self.https.return_value = False
-        self.test_config.set('https-service-endpoints', 'False')
         self.get_local_endpoint.return_value = 'http://localhost:80/v2.0/'
         self.relation_ids.return_value = ['cluster/0']
 
         service_domain = None
+        service_domain_id = None
         service_role = 'Admin'
         if test_api_version > 2:
             service_domain = 'service_domain'
+            service_domain_id = '1234567890'
 
         mock_keystone = MagicMock()
         mock_keystone.resolve_tenant_id.return_value = 'tenant_id'
+        mock_keystone.resolve_domain_id.return_value = service_domain_id
         KeystoneManager.return_value = mock_keystone
 
         self.relation_get.return_value = {'service': 'keystone',
@@ -346,6 +363,7 @@ class TestKeystoneUtils(CharmTestCase):
                                           'admin_url': '10.0.0.2',
                                           'internal_url': '192.168.1.2'}
 
+        mock_keystone.user_exists.return_value = False
         utils.add_service_to_keystone(
             relation_id=relation_id,
             remote_unit=remote_unit)
@@ -374,6 +392,7 @@ class TestKeystoneUtils(CharmTestCase):
                          'service_username': 'keystone',
                          'service_password': 'password',
                          'service_domain': service_domain,
+                         'service_domain_id': service_domain_id,
                          'service_tenant': 'tenant',
                          'https_keystone': '__null__',
                          'ssl_cert': '__null__', 'ssl_key': '__null__',
@@ -382,8 +401,8 @@ class TestKeystoneUtils(CharmTestCase):
                          'service_tenant_id': 'tenant_id',
                          'api_version': test_api_version}
 
-        filtered = {}
-        for k, v in relation_data.iteritems():
+        filtered = collections.OrderedDict()
+        for k, v in relation_data.items():
             if v == '__null__':
                 filtered[k] = None
             else:
@@ -394,6 +413,8 @@ class TestKeystoneUtils(CharmTestCase):
                                                    **relation_data)
         self.relation_set.assert_called_with(relation_id=relation_id,
                                              **filtered)
+        if test_api_version > 2:
+            mock_keystone.resolve_domain_id.assert_called_with(service_domain)
 
     def test_add_service_to_keystone_no_clustered_no_https_complete_values_v3(
             self):
@@ -401,6 +422,8 @@ class TestKeystoneUtils(CharmTestCase):
             test_add_service_to_keystone_no_clustered_no_https_complete_values(
                 test_api_version=3)
 
+    @patch.object(utils, 'leader_set')
+    @patch.object(utils, 'is_leader')
     @patch.object(utils, 'leader_get')
     @patch('charmhelpers.contrib.openstack.ip.config')
     @patch.object(utils, 'ensure_valid_service')
@@ -408,7 +431,7 @@ class TestKeystoneUtils(CharmTestCase):
     @patch.object(utils, 'get_manager')
     def test_add_service_to_keystone_nosubset(
             self, KeystoneManager, add_endpoint, ensure_valid_service,
-            ip_config, leader_get):
+            ip_config, leader_get, is_leader, leader_set):
         relation_id = 'identity-service:0'
         remote_unit = 'unit/0'
 
@@ -419,6 +442,7 @@ class TestKeystoneUtils(CharmTestCase):
                                           'ec2_internal_url': '192.168.1.2'}
         self.get_local_endpoint.return_value = 'http://localhost:80/v2.0/'
         KeystoneManager.resolve_tenant_id.return_value = 'tenant_id'
+        KeystoneManager.user_exists.return_value = False
         leader_get.return_value = None
 
         utils.add_service_to_keystone(
@@ -429,6 +453,49 @@ class TestKeystoneUtils(CharmTestCase):
                                         publicurl='10.0.0.1',
                                         adminurl='10.0.0.2',
                                         internalurl='192.168.1.2')
+
+    @patch.object(utils, 'get_requested_roles')
+    @patch.object(utils, 'create_service_credentials')
+    @patch.object(utils, 'leader_get')
+    @patch('charmhelpers.contrib.openstack.ip.config')
+    @patch.object(utils, 'ensure_valid_service')
+    @patch.object(utils, 'add_endpoint')
+    @patch.object(utils, 'get_manager')
+    def test_add_service_to_keystone_multi_endpoints_bug_1739409(
+            self, KeystoneManager, add_endpoint, ensure_valid_service,
+            ip_config, leader_get, create_service_credentials,
+            get_requested_roles):
+        relation_id = 'identity-service:8'
+        remote_unit = 'nova-cloud-controller/0'
+        get_requested_roles.return_value = 'role1'
+        self.relation_get.return_value = {
+            'ec2_admin_url': 'http://10.5.0.16:8773/services/Cloud',
+            'ec2_internal_url': 'http://10.5.0.16:8773/services/Cloud',
+            'ec2_public_url': 'http://10.5.0.16:8773/services/Cloud',
+            'ec2_region': 'RegionOne',
+            'ec2_service': 'ec2',
+            'nova_admin_url': 'http://10.5.0.16:8774/v2/$(tenant_id)s',
+            'nova_internal_url': 'http://10.5.0.16:8774/v2/$(tenant_id)s',
+            'nova_public_url': 'http://10.5.0.16:8774/v2/$(tenant_id)s',
+            'nova_region': 'RegionOne',
+            'nova_service': 'nova',
+            'private-address': '10.5.0.16',
+            's3_admin_url': 'http://10.5.0.16:3333',
+            's3_internal_url': 'http://10.5.0.16:3333',
+            's3_public_url': 'http://10.5.0.16:3333',
+            's3_region': 'RegionOne',
+            's3_service': 's3'}
+
+        self.get_local_endpoint.return_value = 'http://localhost:80/v2.0/'
+        KeystoneManager.resolve_tenant_id.return_value = 'tenant_id'
+        leader_get.return_value = None
+
+        utils.add_service_to_keystone(
+            relation_id=relation_id,
+            remote_unit=remote_unit)
+        create_service_credentials.assert_called_once_with(
+            'ec2_nova_s3',
+            new_roles='role1')
 
     @patch.object(utils, 'set_service_password')
     @patch.object(utils, 'get_service_password')
@@ -520,43 +587,6 @@ class TestKeystoneUtils(CharmTestCase):
     def test_create_user_credentials_user_exists_v3(self):
         self.test_create_user_credentials_user_exists(test_api_version=3)
 
-    @patch.object(utils, 'get_manager')
-    def test_create_user_case_sensitivity(self, KeystoneManager):
-        """ Test case sensitivity of check for existence in
-            the user creation process """
-        mock_keystone = MagicMock()
-        KeystoneManager.return_value = mock_keystone
-
-        mock_user = MagicMock()
-        mock_keystone.resolve_user_id.return_value = mock_user
-        mock_keystone.api.users.list.return_value = [mock_user]
-
-        # User found is the same i.e. userA == userA
-        mock_user.name = 'userA'
-        utils.create_user('userA', 'passA')
-        mock_keystone.resolve_user_id.assert_called_with('userA',
-                                                         user_domain=None)
-        mock_keystone.create_user.assert_not_called()
-
-        # User found has different case but is the same
-        # i.e. Usera != userA
-        mock_user.name = 'Usera'
-        utils.create_user('userA', 'passA')
-        mock_keystone.resolve_user_id.assert_called_with('userA',
-                                                         user_domain=None)
-        mock_keystone.create_user.assert_not_called()
-
-        # User is different i.e. UserB != userA
-        mock_user.name = 'UserB'
-        utils.create_user('userA', 'passA')
-        mock_keystone.resolve_user_id.assert_called_with('userA',
-                                                         user_domain=None)
-        mock_keystone.create_user.assert_called_with(name='userA',
-                                                     password='passA',
-                                                     tenant_id=None,
-                                                     domain_id=None,
-                                                     email='juju@localhost')
-
     @patch.object(utils, 'set_service_password')
     @patch.object(utils, 'get_service_password')
     @patch.object(utils, 'create_user_credentials')
@@ -629,19 +659,59 @@ class TestKeystoneUtils(CharmTestCase):
         mock_relation_set.assert_called_once_with(relation_id=relation_id,
                                                   relation_settings=settings)
 
-    @patch.object(utils, 'peer_retrieve')
-    @patch.object(utils, 'peer_store')
-    def test_get_admin_passwd_pwd_set(self, mock_peer_store,
-                                      mock_peer_retrieve):
-        mock_peer_retrieve.return_value = None
+    def test_get_admin_passwd_pwd_set(self):
         self.test_config.set('admin-password', 'supersecret')
         self.assertEqual(utils.get_admin_passwd(), 'supersecret')
-        mock_peer_store.assert_called_once_with('admin_passwd', 'supersecret')
 
-    @patch.object(utils, 'peer_retrieve')
+    @patch.object(utils, 'is_leader')
+    @patch.object(utils, 'leader_get')
+    def test_get_admin_passwd_leader_set(self, leader_get, is_leader):
+        is_leader.return_value = False
+        leader_get.return_value = 'admin'
+        self.assertEqual(utils.get_admin_passwd(), 'admin')
+        leader_get.assert_called_with('admin_passwd')
+
+    @patch.object(utils, 'is_leader')
+    @patch.object(utils, 'leader_get')
+    def test_get_admin_passwd_leader_set_user_specified(self, leader_get,
+                                                        is_leader):
+        is_leader.return_value = False
+        leader_get.return_value = 'admin'
+        self.assertEqual(utils.get_admin_passwd(user='test'), 'admin')
+        leader_get.assert_called_with('test_passwd')
+
+    @patch.object(utils, 'is_leader')
+    @patch.object(utils, 'leader_get')
+    def test_get_admin_passwd_leader_set_user_config(self, leader_get,
+                                                     is_leader):
+        is_leader.return_value = False
+        leader_get.return_value = 'admin'
+        self.test_config.set('admin-user', 'test')
+        self.assertEqual(utils.get_admin_passwd(), 'admin')
+        leader_get.assert_called_with('test_passwd')
+
+    @patch.object(utils, 'leader_set')
+    def test_set_admin_password(self, leader_set):
+        utils.set_admin_passwd('secret')
+        leader_set.assert_called_once_with({'admin_passwd': 'secret'})
+
+    @patch.object(utils, 'leader_set')
+    def test_set_admin_password_config_username(self, leader_set):
+        self.test_config.set('admin-user', 'username')
+        utils.set_admin_passwd('secret')
+        leader_set.assert_called_once_with({'username_passwd': 'secret'})
+
+    @patch.object(utils, 'leader_set')
+    def test_set_admin_password_username(self, leader_set):
+        utils.set_admin_passwd('secret', user='username')
+        leader_set.assert_called_once_with({'username_passwd': 'secret'})
+
+    @patch.object(utils, 'is_leader')
+    @patch.object(utils, 'leader_get')
     @patch('os.path.isfile')
-    def test_get_admin_passwd_genpass(self, isfile, peer_retrieve):
-        peer_retrieve.return_value = 'supersecretgen'
+    def test_get_admin_passwd_genpass(self, isfile, leader_get, is_leader):
+        is_leader.return_value = True
+        leader_get.return_value = 'supersecretgen'
         self.test_config.set('admin-password', '')
         isfile.return_value = False
         self.subprocess.check_output.return_value = 'supersecretgen'
@@ -669,7 +739,8 @@ class TestKeystoneUtils(CharmTestCase):
         self.assertFalse(utils.is_db_ready(use_current_context=True))
 
         self.relation_ids.return_value = ['acme:0']
-        self.assertRaises(utils.is_db_ready, use_current_context=True)
+        with self.assertRaises(Exception):
+            utils.is_db_ready(use_current_context=True)
 
         allowed_units = 'unit/0'
         self.related_units.return_value = ['unit/0']
@@ -681,96 +752,6 @@ class TestKeystoneUtils(CharmTestCase):
 
         self.related_units.return_value = []
         self.assertTrue(utils.is_db_ready())
-
-    @patch.object(utils, 'peer_units')
-    def test_ensure_ssl_cert_master_ssl_no_peers(self, mock_peer_units):
-        def mock_rel_get(unit=None, **kwargs):
-            return None
-
-        self.relation_get.side_effect = mock_rel_get
-        self.relation_ids.return_value = ['cluster:0']
-        self.local_unit.return_value = 'unit/0'
-        self.related_units.return_value = []
-        mock_peer_units.return_value = []
-        # This should get ignored since we are overriding
-        self.is_ssl_cert_master.return_value = False
-        self.is_elected_leader.return_value = False
-        self.assertTrue(utils.ensure_ssl_cert_master())
-        settings = {'ssl-cert-master': 'unit/0'}
-        self.relation_set.assert_called_with(relation_id='cluster:0',
-                                             relation_settings=settings)
-
-    @patch.object(utils, 'peer_units')
-    def test_ensure_ssl_cert_master_ssl_master_no_peers(self,
-                                                        mock_peer_units):
-        def mock_rel_get(unit=None, **kwargs):
-            if unit == 'unit/0':
-                return 'unit/0'
-
-            return None
-
-        self.relation_get.side_effect = mock_rel_get
-        self.relation_ids.return_value = ['cluster:0']
-        self.local_unit.return_value = 'unit/0'
-        self.related_units.return_value = []
-        mock_peer_units.return_value = []
-        # This should get ignored since we are overriding
-        self.is_ssl_cert_master.return_value = False
-        self.is_elected_leader.return_value = False
-        self.assertTrue(utils.ensure_ssl_cert_master())
-        settings = {'ssl-cert-master': 'unit/0'}
-        self.relation_set.assert_called_with(relation_id='cluster:0',
-                                             relation_settings=settings)
-
-    @patch.object(utils, 'peer_units')
-    def test_ensure_ssl_cert_master_ssl_not_leader(self, mock_peer_units):
-        self.relation_ids.return_value = ['cluster:0']
-        self.local_unit.return_value = 'unit/0'
-        mock_peer_units.return_value = ['unit/1']
-        self.is_ssl_cert_master.return_value = False
-        self.is_elected_leader.return_value = False
-        self.assertFalse(utils.ensure_ssl_cert_master())
-        self.assertFalse(self.relation_set.called)
-
-    @patch.object(utils, 'peer_units')
-    def test_ensure_ssl_cert_master_is_leader_new_peer(self,
-                                                       mock_peer_units):
-        def mock_rel_get(unit=None, **kwargs):
-            if unit == 'unit/0':
-                return 'unit/0'
-
-            return 'unknown'
-
-        self.relation_get.side_effect = mock_rel_get
-        self.relation_ids.return_value = ['cluster:0']
-        self.local_unit.return_value = 'unit/0'
-        mock_peer_units.return_value = ['unit/1']
-        self.related_units.return_value = ['unit/1']
-        self.is_ssl_cert_master.return_value = False
-        self.is_elected_leader.return_value = True
-        self.assertFalse(utils.ensure_ssl_cert_master())
-        settings = {'ssl-cert-master': 'unit/0'}
-        self.relation_set.assert_called_with(relation_id='cluster:0',
-                                             relation_settings=settings)
-
-    @patch.object(utils, 'peer_units')
-    def test_ensure_ssl_cert_master_is_leader_no_new_peer(self,
-                                                          mock_peer_units):
-        def mock_rel_get(unit=None, **kwargs):
-            if unit == 'unit/0':
-                return 'unit/0'
-
-            return 'unit/0'
-
-        self.relation_get.side_effect = mock_rel_get
-        self.relation_ids.return_value = ['cluster:0']
-        self.local_unit.return_value = 'unit/0'
-        mock_peer_units.return_value = ['unit/1']
-        self.related_units.return_value = ['unit/1']
-        self.is_ssl_cert_master.return_value = False
-        self.is_elected_leader.return_value = True
-        self.assertFalse(utils.ensure_ssl_cert_master())
-        self.assertFalse(self.relation_set.called)
 
     @patch.object(utils, 'leader_set')
     @patch.object(utils, 'leader_get')
@@ -806,109 +787,6 @@ class TestKeystoneUtils(CharmTestCase):
             region='RegionOne',
         )
 
-    @patch.object(utils, 'peer_units')
-    def test_ensure_ssl_cert_master_is_leader_bad_votes(self,
-                                                        mock_peer_units):
-        counter = {0: 0}
-
-        def mock_rel_get(unit=None, **kwargs):
-            """Returns a mix of votes."""
-            if unit == 'unit/0':
-                return 'unit/0'
-
-            ret = 'unit/%d' % (counter[0])
-            counter[0] += 1
-            return ret
-
-        self.relation_get.side_effect = mock_rel_get
-        self.relation_ids.return_value = ['cluster:0']
-        self.local_unit.return_value = 'unit/0'
-        mock_peer_units.return_value = ['unit/1']
-        self.related_units.return_value = ['unit/1']
-        self.is_ssl_cert_master.return_value = False
-        self.is_elected_leader.return_value = True
-        self.assertFalse(utils.ensure_ssl_cert_master())
-        self.assertFalse(self.relation_set.called)
-
-    @patch.object(utils, 'git_install_requested')
-    @patch.object(utils, 'git_post_install')
-    @patch.object(utils, 'git_pre_install')
-    def test_git_install(self, git_requested, git_pre, git_post):
-        projects_yaml = openstack_origin_git
-        git_requested.return_value = True
-        utils.git_install(projects_yaml)
-        self.assertTrue(git_pre.called)
-        self.git_clone_and_install.assert_called_with(openstack_origin_git,
-                                                      core_project='keystone')
-        self.assertTrue(git_post.called)
-
-    @patch.object(utils, 'mkdir')
-    @patch.object(utils, 'write_file')
-    @patch.object(utils, 'add_user_to_group')
-    @patch.object(utils, 'add_group')
-    @patch.object(utils, 'adduser')
-    def test_git_pre_install(self, adduser, add_group, add_user_to_group,
-                             write_file, mkdir):
-        utils.git_pre_install()
-        adduser.assert_called_with('keystone', shell='/bin/bash',
-                                   system_user=True,
-                                   home_dir='/var/lib/keystone')
-        add_group.assert_called_with('keystone', system_group=True)
-        add_user_to_group.assert_called_with('keystone', 'keystone')
-        expected = [
-            call('/var/lib/keystone', owner='keystone',
-                 group='keystone', perms=0755, force=False),
-            call('/var/lib/keystone/cache', owner='keystone',
-                 group='keystone', perms=0755, force=False),
-            call('/var/log/keystone', owner='keystone',
-                 group='keystone', perms=0755, force=False),
-        ]
-        self.assertEqual(mkdir.call_args_list, expected)
-        write_file.assert_called_with('/var/log/keystone/keystone.log',
-                                      '', owner='keystone', group='keystone',
-                                      perms=0600)
-
-    @patch('os.path.join')
-    @patch('os.path.exists')
-    @patch('os.symlink')
-    @patch('shutil.copytree')
-    @patch('shutil.rmtree')
-    @patch('subprocess.check_call')
-    def test_git_post_install(self, check_call, rmtree, copytree, symlink,
-                              exists, join):
-        self.os_release.return_value = 'havana'
-        projects_yaml = openstack_origin_git
-        join.return_value = 'joined-string'
-        self.git_pip_venv_dir.return_value = '/mnt/openstack-git/venv'
-        self.lsb_release.return_value = {'DISTRIB_RELEASE': '15.04'}
-        utils.git_post_install(projects_yaml)
-        expected = [
-            call('joined-string', '/etc/keystone'),
-        ]
-        copytree.assert_has_calls(expected)
-        expected = [
-            call('joined-string', '/usr/local/bin/keystone-manage'),
-        ]
-        symlink.assert_has_calls(expected, any_order=True)
-        keystone_context = {
-            'service_description': 'Keystone API server',
-            'service_name': 'Keystone',
-            'user_name': 'keystone',
-            'start_dir': '/var/lib/keystone',
-            'process_name': 'keystone',
-            'executable_name': 'joined-string',
-            'config_files': ['/etc/keystone/keystone.conf'],
-            'log_file': '/var/log/keystone/keystone.log',
-        }
-        expected = [
-            call('git/logging.conf', '/etc/keystone/logging.conf', {},
-                 perms=0o644),
-            call('git.upstart', '/etc/init/keystone.conf',
-                 keystone_context, perms=0o644, templates_dir='joined-string'),
-        ]
-        self.assertEqual(self.render.call_args_list, expected)
-        self.service_restart.assert_called_with('keystone')
-
     @patch.object(utils, 'get_manager')
     def test_is_service_present(self, KeystoneManager):
         mock_keystone = MagicMock()
@@ -929,19 +807,13 @@ class TestKeystoneUtils(CharmTestCase):
         mock_keystone.resolve_service_id.return_value = 'sid1'
         KeystoneManager.return_value = mock_keystone
         utils.delete_service_entry('bob', 'bill')
-        mock_keystone.api.services.delete.assert_called_with('sid1')
+        mock_keystone.delete_service_by_id.assert_called_once_with('sid1')
 
     @patch('os.path.isfile')
     def test_get_file_stored_domain_id(self, isfile_mock):
         isfile_mock.return_value = False
         x = utils.get_file_stored_domain_id('/a/file')
         assert x is None
-        from sys import version_info
-        if version_info.major == 2:
-            import __builtin__ as builtins
-        else:
-            import builtins
-        from mock import mock_open
         with patch.object(builtins, 'open', mock_open(
                 read_data="some_data\n")):
             isfile_mock.return_value = True
@@ -1019,14 +891,18 @@ class TestKeystoneUtils(CharmTestCase):
         utils.restart_pid_check('apache2')
         self.service_stop.assert_called_once_with('apache2')
         self.service_start.assert_called_once_with('apache2')
-        self.subprocess.call.assert_called_once_with(['pgrep', 'apache2'])
+        self.subprocess.call.assert_called_once_with(
+            ['pgrep', 'apache2', '--nslist', 'pid', '--ns', str(os.getpid())]
+        )
 
     def test_restart_pid_check_ptable_string(self):
         self.subprocess.call.return_value = 1
         utils.restart_pid_check('apache2', ptable_string='httpd')
         self.service_stop.assert_called_once_with('apache2')
         self.service_start.assert_called_once_with('apache2')
-        self.subprocess.call.assert_called_once_with(['pgrep', 'httpd'])
+        self.subprocess.call.assert_called_once_with(
+            ['pgrep', 'httpd', '--nslist', 'pid', '--ns', str(os.getpid())]
+        )
 
     # Do not sleep() to speed up manual runs.
     @patch('charmhelpers.core.decorators.time')
@@ -1038,9 +914,12 @@ class TestKeystoneUtils(CharmTestCase):
         self.service_start.assert_called_once_with('apache2')
 #        self.subprocess.call.assert_called_once_with(['pgrep', 'httpd'])
         expected = [
-            call(['pgrep', 'httpd']),
-            call(['pgrep', 'httpd']),
-            call(['pgrep', 'httpd']),
+            call(['pgrep', 'httpd', '--nslist', 'pid', '--ns',
+                 str(os.getpid())]),
+            call(['pgrep', 'httpd', '--nslist', 'pid', '--ns',
+                 str(os.getpid())]),
+            call(['pgrep', 'httpd', '--nslist', 'pid', '--ns',
+                 str(os.getpid())])
         ]
         self.assertEqual(self.subprocess.call.call_args_list, expected)
 
@@ -1064,16 +943,6 @@ class TestKeystoneUtils(CharmTestCase):
         https.return_value = True
         protocol = utils.get_protocol()
         self.assertEqual(protocol, 'https')
-
-    def test_get_ssl_ca_settings(self):
-        CA = MagicMock()
-        CA.get_ca_bundle.return_value = 'certstring'
-        self.test_config.set('https-service-endpoints', 'True')
-        self.get_ca.return_value = CA
-        expected_settings = {'https_keystone': 'True',
-                             'ca_cert': b64encode('certstring')}
-        settings = utils.get_ssl_ca_settings()
-        self.assertEqual(settings, expected_settings)
 
     @patch.object(utils, 'get_manager')
     def test_add_credentials_keystone_not_ready(self, get_manager):
@@ -1260,67 +1129,6 @@ class TestKeystoneUtils(CharmTestCase):
         self.peer_store_and_set.assert_called_with(relation_id=relation_id,
                                                    **relation_data)
 
-    @patch.object(utils, 'set_service_password')
-    @patch.object(utils, 'get_service_password')
-    @patch.object(utils, 'get_ssl_ca_settings')
-    @patch.object(utils, 'create_user_credentials')
-    @patch.object(utils, 'get_protocol')
-    @patch.object(utils, 'resolve_address')
-    @patch.object(utils, 'get_api_version')
-    @patch.object(utils, 'get_manager')
-    def test_add_credentials_keystone_ssl(self, get_manager,
-                                          get_api_version,
-                                          resolve_address,
-                                          get_protocol,
-                                          create_user_credentials,
-                                          get_ssl_ca_settings,
-                                          get_callback, set_callback):
-        """ Verify add_credentials with SSL """
-        manager = MagicMock()
-        manager.resolve_tenant_id.return_value = 'abcdef0123456789'
-        get_manager.return_value = manager
-        remote_unit = 'unit/0'
-        relation_id = 'identity-credentials:0'
-        get_api_version.return_value = 2
-        get_protocol.return_value = 'https'
-        resolve_address.return_value = '10.10.10.10'
-        create_user_credentials.return_value = 'password'
-        get_ssl_ca_settings.return_value = {'https_keystone': 'True',
-                                            'ca_cert': 'base64certstring'}
-        self.relation_get.return_value = {'username': 'requester'}
-        self.get_service_password.return_value = 'password'
-        self.get_requested_roles.return_value = []
-        self.test_config.set('admin-port', 80)
-        self.test_config.set('service-port', 81)
-        self.test_config.set('https-service-endpoints', 'True')
-        relation_data = {'auth_host': '10.10.10.10',
-                         'credentials_host': '10.10.10.10',
-                         'credentials_port': 81,
-                         'auth_port': 80,
-                         'auth_protocol': 'https',
-                         'credentials_username': 'requester',
-                         'credentials_protocol': 'https',
-                         'credentials_password': 'password',
-                         'credentials_project': 'services',
-                         'credentials_project_id': 'abcdef0123456789',
-                         'region': 'RegionOne',
-                         'api_version': 2,
-                         'https_keystone': 'True',
-                         'ca_cert': 'base64certstring'}
-
-        utils.add_credentials_to_keystone(
-            relation_id=relation_id,
-            remote_unit=remote_unit)
-        create_user_credentials.assert_called_with('requester',
-                                                   get_callback,
-                                                   set_callback,
-                                                   domain=None,
-                                                   new_roles=[],
-                                                   grants=['Admin'],
-                                                   tenant='services')
-        self.peer_store_and_set.assert_called_with(relation_id=relation_id,
-                                                   **relation_data)
-
     @patch.object(utils.os, 'remove')
     @patch.object(utils.os.path, 'exists')
     def test_disable_unused_apache_sites(self, os_path_exists, os_remove):
@@ -1357,3 +1165,246 @@ class TestKeystoneUtils(CharmTestCase):
     def test_run_in_apache_set_release(self):
         self.os_release.return_value = 'kilo'
         self.assertTrue(utils.run_in_apache(release='liberty'))
+
+    def test_get_api_version_icehouse(self):
+        self.assertEqual(utils.get_api_version(), 2)
+
+    def test_get_api_version_queens(self):
+        self.get_os_codename_install_source.return_value = 'queens'
+        self.assertEqual(utils.get_api_version(), 3)
+
+    def test_get_api_version_invalid_option_value(self):
+        self.test_config.set('preferred-api-version', 4)
+        with self.assertRaises(ValueError):
+            utils.get_api_version()
+
+    def test_get_api_version_queens_invalid_option_value(self):
+        self.test_config.set('preferred-api-version', 2)
+        self.get_os_codename_install_source.return_value = 'queens'
+        with self.assertRaises(ValueError):
+            utils.get_api_version()
+
+    @patch.object(utils, 'is_leader')
+    @patch('os.path.exists')
+    def test_key_setup(self, mock_path_exists, mock_is_leader):
+        base_cmd = ['sudo', '-u', 'keystone', 'keystone-manage']
+        mock_is_leader.return_value = True
+        mock_path_exists.return_value = False
+        with patch.object(builtins, 'open', mock_open()) as m:
+            utils.key_setup()
+            m.assert_called_once_with(utils.KEY_SETUP_FILE, "w")
+        self.subprocess.check_output.has_calls(
+            [
+                base_cmd + ['fernet_setup'],
+                base_cmd + ['credential_setup'],
+                base_cmd + ['credential_migrate'],
+            ])
+        mock_path_exists.assert_called_once_with(utils.KEY_SETUP_FILE)
+        mock_is_leader.assert_called_once_with()
+
+    def test_fernet_rotate(self):
+        cmd = ['sudo', '-u', 'keystone', 'keystone-manage', 'fernet_rotate']
+        utils.fernet_rotate()
+        self.subprocess.check_output.called_with(cmd)
+
+    @patch.object(utils, 'leader_set')
+    @patch('os.listdir')
+    def test_key_leader_set(self, listdir, leader_set):
+        listdir.return_value = ['0', '1']
+        self.time.time.return_value = "the-time"
+        with patch.object(builtins, 'open', mock_open(
+                read_data="some_data")):
+            utils.key_leader_set()
+        listdir.has_calls([
+            call(utils.FERNET_KEY_REPOSITORY),
+            call(utils.CREDENTIAL_KEY_REPOSITORY)])
+        leader_set.assert_called_with(
+            {'key_repository': json.dumps(
+                {utils.FERNET_KEY_REPOSITORY:
+                    {'0': 'some_data', '1': 'some_data'},
+                 utils.CREDENTIAL_KEY_REPOSITORY:
+                    {'0': 'some_data', '1': 'some_data'}})
+             })
+
+    @patch('os.rename')
+    @patch.object(utils, 'leader_get')
+    @patch('os.listdir')
+    @patch('os.remove')
+    def test_key_write(self, remove, listdir, leader_get, rename):
+        leader_get.return_value = json.dumps(
+            {utils.FERNET_KEY_REPOSITORY:
+                {'0': 'key0', '1': 'key1'},
+             utils.CREDENTIAL_KEY_REPOSITORY:
+                {'0': 'key0', '1': 'key1'}})
+        listdir.return_value = ['0', '1', '2']
+        with patch.object(builtins, 'open', mock_open()) as m:
+            utils.key_write()
+            m.assert_called_with(utils.KEY_SETUP_FILE, "w")
+        self.mkdir.has_calls([call(utils.CREDENTIAL_KEY_REPOSITORY,
+                                   owner='keystone', group='keystone',
+                                   perms=0o700),
+                              call(utils.FERNET_KEY_REPOSITORY,
+                                   owner='keystone', group='keystone',
+                                   perms=0o700)])
+        # note 'any_order=True' as we are dealing with dictionaries in Py27
+        self.write_file.assert_has_calls(
+            [
+                call(os.path.join(utils.CREDENTIAL_KEY_REPOSITORY, '.0'),
+                     u'key0', owner='keystone', group='keystone', perms=0o600),
+                call(os.path.join(utils.CREDENTIAL_KEY_REPOSITORY, '.1'),
+                     u'key1', owner='keystone', group='keystone', perms=0o600),
+                call(os.path.join(utils.FERNET_KEY_REPOSITORY, '.0'), u'key0',
+                     owner='keystone', group='keystone', perms=0o600),
+                call(os.path.join(utils.FERNET_KEY_REPOSITORY, '.1'), u'key1',
+                     owner='keystone', group='keystone', perms=0o600),
+            ], any_order=True)
+        rename.assert_has_calls(
+            [
+                call(os.path.join(utils.CREDENTIAL_KEY_REPOSITORY, '.0'),
+                     os.path.join(utils.CREDENTIAL_KEY_REPOSITORY, '0')),
+                call(os.path.join(utils.CREDENTIAL_KEY_REPOSITORY, '.1'),
+                     os.path.join(utils.CREDENTIAL_KEY_REPOSITORY, '1')),
+                call(os.path.join(utils.FERNET_KEY_REPOSITORY, '.0'),
+                     os.path.join(utils.FERNET_KEY_REPOSITORY, '0')),
+                call(os.path.join(utils.FERNET_KEY_REPOSITORY, '.1'),
+                     os.path.join(utils.FERNET_KEY_REPOSITORY, '1')),
+            ], any_order=True)
+
+    @patch.object(utils, 'keystone_context')
+    @patch.object(utils, 'fernet_rotate')
+    @patch.object(utils, 'key_leader_set')
+    @patch.object(utils, 'os')
+    @patch.object(utils, 'is_leader')
+    def test_fernet_keys_rotate_and_sync(self, mock_is_leader, mock_os,
+                                         mock_key_leader_set,
+                                         mock_fernet_rotate,
+                                         mock_keystone_context):
+        self.test_config.set('fernet-max-active-keys', 3)
+        self.test_config.set('token-expiration', 60)
+        self.time.time.return_value = 0
+
+        # if not leader shouldn't do anything
+        mock_is_leader.return_value = False
+        utils.fernet_keys_rotate_and_sync()
+        mock_os.stat.assert_not_called()
+        # shouldn't do anything as the token provider is wrong
+        mock_keystone_context.fernet_enabled.return_value = False
+        mock_is_leader.return_value = True
+        utils.fernet_keys_rotate_and_sync()
+        mock_os.stat.assert_not_called()
+        # fail gracefully if key repository is not initialized
+        mock_keystone_context.fernet_enabled.return_value = True
+        mock_os.stat.side_effect = Exception()
+        with self.assertRaises(Exception):
+            utils.fernet_keys_rotate_and_sync()
+        self.time.time.assert_not_called()
+        mock_os.stat.side_effect = None
+        # now set up the times, so that it still shouldn't be called.
+        self.time.time.return_value = 30
+        self.time.gmtime = time.gmtime
+        self.time.asctime = time.asctime
+        _stat = MagicMock()
+        _stat.st_mtime = 10
+        mock_os.stat.return_value = _stat
+        utils.fernet_keys_rotate_and_sync(log_func=self.log)
+        self.log.assert_called_once_with(
+            'No rotation until at least Thu Jan  1 00:01:10 1970',
+            level='DEBUG')
+        mock_key_leader_set.assert_not_called()
+        # finally, set it up so that the rotation and sync occur
+        self.time.time.return_value = 71
+        utils.fernet_keys_rotate_and_sync()
+        mock_fernet_rotate.assert_called_once_with()
+        mock_key_leader_set.assert_called_once_with()
+
+    @patch.object(utils, 'container_scoped_relations')
+    @patch.object(utils, 'expected_related_units')
+    @patch.object(utils, 'expected_peer_units')
+    @patch.object(utils, 'related_units')
+    @patch.object(utils, 'expect_ha')
+    @patch.object(utils, 'relation_ids')
+    def test_is_expected_scale(self, relation_ids, expect_ha, related_units,
+                               expected_peer_units, expected_related_units,
+                               container_scoped_relations):
+        container_scoped_relations.return_value = ['ha']
+        relation_ids.return_value = ['FAKE_RID']
+        expect_ha.return_value = False
+        related_units.return_value = ['unit/0', 'unit/1', 'unit/2']
+        expected_peer_units.return_value = iter(related_units.return_value)
+        expected_related_units.return_value = iter(related_units.return_value)
+        self.assertTrue(utils.is_expected_scale())
+        relation_ids.assert_has_calls([
+            call(reltype='cluster'),
+            call(reltype='shared-db')])
+        related_units.assert_called_with(relid='FAKE_RID')
+
+    @patch.object(utils, 'container_scoped_relations')
+    @patch.object(utils, 'expected_related_units')
+    @patch.object(utils, 'expected_peer_units')
+    @patch.object(utils, 'related_units')
+    @patch.object(utils, 'expect_ha')
+    @patch.object(utils, 'relation_ids')
+    def test_is_expected_scale_ha(self, relation_ids, expect_ha, related_units,
+                                  expected_peer_units, expected_related_units,
+                                  container_scoped_relations):
+        container_scoped_relations.return_value = ['ha']
+        relation_ids.return_value = ['FAKE_RID']
+        expect_ha.return_value = True
+        related_units.return_value = ['unit/0', 'unit/1', 'unit/2']
+        expected_peer_units.return_value = iter(related_units.return_value)
+        expected_related_units.return_value = iter(related_units.return_value)
+        self.assertTrue(utils.is_expected_scale())
+        relation_ids.assert_has_calls([
+            call(reltype='cluster'),
+            call(reltype='shared-db'),
+            call(reltype='ha')])
+        related_units.assert_called_with(relid='FAKE_RID')
+
+    @patch.object(utils, 'expected_related_units')
+    @patch.object(utils, 'expected_peer_units')
+    @patch.object(utils, 'related_units')
+    @patch.object(utils, 'expect_ha')
+    @patch.object(utils, 'relation_ids')
+    def test_not_is_expected_scale(self, relation_ids, expect_ha,
+                                   related_units, expected_peer_units,
+                                   expected_related_units):
+        relation_ids.return_value = ['FAKE_RID']
+        expect_ha.return_value = False
+        related_units.return_value = ['unit/0', 'unit/1']
+        expected_peer_units.return_value = iter(['unit/0', 'unit/1', 'unit/2'])
+        expected_related_units.return_value = iter(
+            ['unit/0', 'unit/1', 'unit/2'])
+        self.assertFalse(utils.is_expected_scale())
+        relation_ids.assert_has_calls([
+            call(reltype='cluster'),
+            call(reltype='shared-db')])
+        related_units.assert_called_with(relid='FAKE_RID')
+
+    @patch.object(utils, 'expected_related_units')
+    @patch.object(utils, 'expected_peer_units')
+    @patch.object(utils, 'related_units')
+    @patch.object(utils, 'expect_ha')
+    @patch.object(utils, 'relation_ids')
+    def test_is_expected_scale_no_goal_state_support(self, relation_ids,
+                                                     expect_ha, related_units,
+                                                     expected_peer_units,
+                                                     expected_related_units):
+        relation_ids.return_value = ['FAKE_RID']
+        related_units.return_value = ['unit/0', 'unit/1', 'unit/2']
+        expected_peer_units.side_effect = NotImplementedError
+        self.assertTrue(utils.is_expected_scale())
+        expected_related_units.assert_not_called()
+
+    @patch.object(utils, 'metadata')
+    def test_container_scoped_relations(self, metadata):
+        _metadata = {
+            'provides': {
+                'amqp': {'interface': 'rabbitmq'},
+                'identity-service': {'interface': 'keystone'},
+                'ha': {
+                    'interface': 'hacluster',
+                    'scope': 'container'}},
+            'peers': {
+                'cluster': {'interface': 'openstack-ha'}}}
+        metadata.return_value = _metadata
+        self.assertEqual(utils.container_scoped_relations(), ['ha'])

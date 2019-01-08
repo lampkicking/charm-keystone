@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import glob
 import json
 import math
@@ -92,14 +93,14 @@ from charmhelpers.contrib.network.ip import (
     format_ipv6_addr,
     is_bridge_member,
     is_ipv6_disabled,
+    get_relation_ip,
 )
 from charmhelpers.contrib.openstack.utils import (
     config_flags_parser,
-    get_host_ip,
-    git_determine_usr_bin,
-    git_determine_python_path,
     enable_memcache,
     snap_install_requested,
+    CompareOpenStackReleases,
+    os_release,
 )
 from charmhelpers.core.unitdata import kv
 
@@ -189,8 +190,8 @@ class OSContextGenerator(object):
 class SharedDBContext(OSContextGenerator):
     interfaces = ['shared-db']
 
-    def __init__(self,
-                 database=None, user=None, relation_prefix=None, ssl_dir=None):
+    def __init__(self, database=None, user=None, relation_prefix=None,
+                 ssl_dir=None, relation_id=None):
         """Allows inspecting relation for settings prefixed with
         relation_prefix. This is useful for parsing access for multiple
         databases returned via the shared-db interface (eg, nova_password,
@@ -201,6 +202,7 @@ class SharedDBContext(OSContextGenerator):
         self.user = user
         self.ssl_dir = ssl_dir
         self.rel_name = self.interfaces[0]
+        self.relation_id = relation_id
 
     def __call__(self):
         self.database = self.database or config('database')
@@ -234,7 +236,12 @@ class SharedDBContext(OSContextGenerator):
         if self.relation_prefix:
             password_setting = self.relation_prefix + '_password'
 
-        for rid in relation_ids(self.interfaces[0]):
+        if self.relation_id:
+            rids = [self.relation_id]
+        else:
+            rids = relation_ids(self.interfaces[0])
+
+        for rid in rids:
             self.related = True
             for unit in related_units(rid):
                 rdata = relation_get(rid=rid, unit=unit)
@@ -292,7 +299,7 @@ class PostgresqlDBContext(OSContextGenerator):
 def db_ssl(rdata, ctxt, ssl_dir):
     if 'ssl_ca' in rdata and ssl_dir:
         ca_path = os.path.join(ssl_dir, 'db-client.ca')
-        with open(ca_path, 'w') as fh:
+        with open(ca_path, 'wb') as fh:
             fh.write(b64decode(rdata['ssl_ca']))
 
         ctxt['database_ssl_ca'] = ca_path
@@ -307,12 +314,12 @@ def db_ssl(rdata, ctxt, ssl_dir):
             log("Waiting 1m for ssl client cert validity", level=INFO)
             time.sleep(60)
 
-        with open(cert_path, 'w') as fh:
+        with open(cert_path, 'wb') as fh:
             fh.write(b64decode(rdata['ssl_cert']))
 
         ctxt['database_ssl_cert'] = cert_path
         key_path = os.path.join(ssl_dir, 'db-client.key')
-        with open(key_path, 'w') as fh:
+        with open(key_path, 'wb') as fh:
             fh.write(b64decode(rdata['ssl_key']))
 
         ctxt['database_ssl_key'] = key_path
@@ -331,10 +338,7 @@ class IdentityServiceContext(OSContextGenerator):
         self.rel_name = rel_name
         self.interfaces = [self.rel_name]
 
-    def __call__(self):
-        log('Generating template context for ' + self.rel_name, level=DEBUG)
-        ctxt = {}
-
+    def _setup_pki_cache(self):
         if self.service and self.service_user:
             # This is required for pki token signing if we don't want /tmp to
             # be used.
@@ -344,6 +348,15 @@ class IdentityServiceContext(OSContextGenerator):
                 mkdir(path=cachedir, owner=self.service_user,
                       group=self.service_user, perms=0o700)
 
+            return cachedir
+        return None
+
+    def __call__(self):
+        log('Generating template context for ' + self.rel_name, level=DEBUG)
+        ctxt = {}
+
+        cachedir = self._setup_pki_cache()
+        if cachedir:
             ctxt['signing_dir'] = cachedir
 
         for rid in relation_ids(self.rel_name):
@@ -377,6 +390,63 @@ class IdentityServiceContext(OSContextGenerator):
                     # so a missing value just indicates keystone needs
                     # upgrading
                     ctxt['admin_tenant_id'] = rdata.get('service_tenant_id')
+                    ctxt['admin_domain_id'] = rdata.get('service_domain_id')
+                    return ctxt
+
+        return {}
+
+
+class IdentityCredentialsContext(IdentityServiceContext):
+    '''Context for identity-credentials interface type'''
+
+    def __init__(self,
+                 service=None,
+                 service_user=None,
+                 rel_name='identity-credentials'):
+        super(IdentityCredentialsContext, self).__init__(service,
+                                                         service_user,
+                                                         rel_name)
+
+    def __call__(self):
+        log('Generating template context for ' + self.rel_name, level=DEBUG)
+        ctxt = {}
+
+        cachedir = self._setup_pki_cache()
+        if cachedir:
+            ctxt['signing_dir'] = cachedir
+
+        for rid in relation_ids(self.rel_name):
+            self.related = True
+            for unit in related_units(rid):
+                rdata = relation_get(rid=rid, unit=unit)
+                credentials_host = rdata.get('credentials_host')
+                credentials_host = (
+                    format_ipv6_addr(credentials_host) or credentials_host
+                )
+                auth_host = rdata.get('auth_host')
+                auth_host = format_ipv6_addr(auth_host) or auth_host
+                svc_protocol = rdata.get('credentials_protocol') or 'http'
+                auth_protocol = rdata.get('auth_protocol') or 'http'
+                api_version = rdata.get('api_version') or '2.0'
+                ctxt.update({
+                    'service_port': rdata.get('credentials_port'),
+                    'service_host': credentials_host,
+                    'auth_host': auth_host,
+                    'auth_port': rdata.get('auth_port'),
+                    'admin_tenant_name': rdata.get('credentials_project'),
+                    'admin_tenant_id': rdata.get('credentials_project_id'),
+                    'admin_user': rdata.get('credentials_username'),
+                    'admin_password': rdata.get('credentials_password'),
+                    'service_protocol': svc_protocol,
+                    'auth_protocol': auth_protocol,
+                    'api_version': api_version
+                })
+
+                if float(api_version) > 2:
+                    ctxt.update({'admin_domain_name':
+                                 rdata.get('domain')})
+
+                if self.context_complete(ctxt):
                     return ctxt
 
         return {}
@@ -384,11 +454,13 @@ class IdentityServiceContext(OSContextGenerator):
 
 class AMQPContext(OSContextGenerator):
 
-    def __init__(self, ssl_dir=None, rel_name='amqp', relation_prefix=None):
+    def __init__(self, ssl_dir=None, rel_name='amqp', relation_prefix=None,
+                 relation_id=None):
         self.ssl_dir = ssl_dir
         self.rel_name = rel_name
         self.relation_prefix = relation_prefix
         self.interfaces = [rel_name]
+        self.relation_id = relation_id
 
     def __call__(self):
         log('Generating template context for amqp', level=DEBUG)
@@ -409,7 +481,11 @@ class AMQPContext(OSContextGenerator):
             raise OSContextError
 
         ctxt = {}
-        for rid in relation_ids(self.rel_name):
+        if self.relation_id:
+            rids = [self.relation_id]
+        else:
+            rids = relation_ids(self.rel_name)
+        for rid in rids:
             ha_vip_only = False
             self.related = True
             transport_hosts = None
@@ -458,7 +534,7 @@ class AMQPContext(OSContextGenerator):
 
                         ca_path = os.path.join(
                             self.ssl_dir, 'rabbit-client-ca.pem')
-                        with open(ca_path, 'w') as fh:
+                        with open(ca_path, 'wb') as fh:
                             fh.write(b64decode(ctxt['rabbit_ssl_ca']))
                             ctxt['rabbit_ssl_ca'] = ca_path
 
@@ -554,7 +630,9 @@ class HAProxyContext(OSContextGenerator):
     """
     interfaces = ['cluster']
 
-    def __init__(self, singlenode_mode=False):
+    def __init__(self, singlenode_mode=False,
+                 address_types=ADDRESS_TYPES):
+        self.address_types = address_types
         self.singlenode_mode = singlenode_mode
 
     def __call__(self):
@@ -563,41 +641,56 @@ class HAProxyContext(OSContextGenerator):
         if not relation_ids('cluster') and not self.singlenode_mode:
             return {}
 
-        if config('prefer-ipv6'):
-            addr = get_ipv6_addr(exc_list=[config('vip')])[0]
-        else:
-            addr = get_host_ip(unit_get('private-address'))
-
         l_unit = local_unit().replace('/', '-')
-        cluster_hosts = {}
+        cluster_hosts = collections.OrderedDict()
 
         # NOTE(jamespage): build out map of configured network endpoints
         # and associated backends
-        for addr_type in ADDRESS_TYPES:
+        for addr_type in self.address_types:
             cfg_opt = 'os-{}-network'.format(addr_type)
-            laddr = get_address_in_network(config(cfg_opt))
+            # NOTE(thedac) For some reason the ADDRESS_MAP uses 'int' rather
+            # than 'internal'
+            if addr_type == 'internal':
+                _addr_map_type = INTERNAL
+            else:
+                _addr_map_type = addr_type
+            # Network spaces aware
+            laddr = get_relation_ip(ADDRESS_MAP[_addr_map_type]['binding'],
+                                    config(cfg_opt))
             if laddr:
                 netmask = get_netmask_for_address(laddr)
-                cluster_hosts[laddr] = {'network': "{}/{}".format(laddr,
-                                                                  netmask),
-                                        'backends': {l_unit: laddr}}
+                cluster_hosts[laddr] = {
+                    'network': "{}/{}".format(laddr,
+                                              netmask),
+                    'backends': collections.OrderedDict([(l_unit,
+                                                          laddr)])
+                }
                 for rid in relation_ids('cluster'):
-                    for unit in related_units(rid):
+                    for unit in sorted(related_units(rid)):
+                        # API Charms will need to set {addr_type}-address with
+                        # get_relation_ip(addr_type)
                         _laddr = relation_get('{}-address'.format(addr_type),
                                               rid=rid, unit=unit)
                         if _laddr:
                             _unit = unit.replace('/', '-')
                             cluster_hosts[laddr]['backends'][_unit] = _laddr
 
-        # NOTE(jamespage) add backend based on private address - this
-        # with either be the only backend or the fallback if no acls
+        # NOTE(jamespage) add backend based on get_relation_ip - this
+        # will either be the only backend or the fallback if no acls
         # match in the frontend
+        # Network spaces aware
+        addr = get_relation_ip('cluster')
         cluster_hosts[addr] = {}
         netmask = get_netmask_for_address(addr)
-        cluster_hosts[addr] = {'network': "{}/{}".format(addr, netmask),
-                               'backends': {l_unit: addr}}
+        cluster_hosts[addr] = {
+            'network': "{}/{}".format(addr, netmask),
+            'backends': collections.OrderedDict([(l_unit,
+                                                  addr)])
+        }
         for rid in relation_ids('cluster'):
-            for unit in related_units(rid):
+            for unit in sorted(related_units(rid)):
+                # API Charms will need to set their private-address with
+                # get_relation_ip('cluster')
                 _laddr = relation_get('private-address',
                                       rid=rid, unit=unit)
                 if _laddr:
@@ -627,6 +720,8 @@ class HAProxyContext(OSContextGenerator):
         else:
             ctxt['local_host'] = '127.0.0.1'
             ctxt['haproxy_host'] = '0.0.0.0'
+
+        ctxt['ipv6_enabled'] = not is_ipv6_disabled()
 
         ctxt['stat_port'] = '8888'
 
@@ -706,17 +801,18 @@ class ApacheSSLContext(OSContextGenerator):
         ssl_dir = os.path.join('/etc/apache2/ssl/', self.service_namespace)
         mkdir(path=ssl_dir)
         cert, key = get_cert(cn)
-        if cn:
-            cert_filename = 'cert_{}'.format(cn)
-            key_filename = 'key_{}'.format(cn)
-        else:
-            cert_filename = 'cert'
-            key_filename = 'key'
+        if cert and key:
+            if cn:
+                cert_filename = 'cert_{}'.format(cn)
+                key_filename = 'key_{}'.format(cn)
+            else:
+                cert_filename = 'cert'
+                key_filename = 'key'
 
-        write_file(path=os.path.join(ssl_dir, cert_filename),
-                   content=b64decode(cert))
-        write_file(path=os.path.join(ssl_dir, key_filename),
-                   content=b64decode(key))
+            write_file(path=os.path.join(ssl_dir, cert_filename),
+                       content=b64decode(cert), perms=0o640)
+            write_file(path=os.path.join(ssl_dir, key_filename),
+                       content=b64decode(key), perms=0o640)
 
     def configure_ca(self):
         ca_cert = get_ca_cert()
@@ -788,23 +884,31 @@ class ApacheSSLContext(OSContextGenerator):
         if not self.external_ports or not https():
             return {}
 
-        self.configure_ca()
+        use_keystone_ca = True
+        for rid in relation_ids('certificates'):
+            if related_units(rid):
+                use_keystone_ca = False
+
+        if use_keystone_ca:
+            self.configure_ca()
+
         self.enable_modules()
 
         ctxt = {'namespace': self.service_namespace,
                 'endpoints': [],
                 'ext_ports': []}
 
-        cns = self.canonical_names()
-        if cns:
-            for cn in cns:
-                self.configure_cert(cn)
-        else:
-            # Expect cert/key provided in config (currently assumed that ca
-            # uses ip for cn)
-            for net_type in (INTERNAL, ADMIN, PUBLIC):
-                cn = resolve_address(endpoint_type=net_type)
-                self.configure_cert(cn)
+        if use_keystone_ca:
+            cns = self.canonical_names()
+            if cns:
+                for cn in cns:
+                    self.configure_cert(cn)
+            else:
+                # Expect cert/key provided in config (currently assumed that ca
+                # uses ip for cn)
+                for net_type in (INTERNAL, ADMIN, PUBLIC):
+                    cn = resolve_address(endpoint_type=net_type)
+                    self.configure_cert(cn)
 
         addresses = self.get_network_addresses()
         for address, endpoint in addresses:
@@ -843,15 +947,6 @@ class NeutronContext(OSContextGenerator):
     def _ensure_packages(self):
         for pkgs in self.packages:
             ensure_packages(pkgs)
-
-    def _save_flag_file(self):
-        if self.network_manager == 'quantum':
-            _file = '/etc/nova/quantum_plugin.conf'
-        else:
-            _file = '/etc/nova/neutron_plugin.conf'
-
-        with open(_file, 'wb') as out:
-            out.write(self.plugin + '\n')
 
     def ovs_ctxt(self):
         driver = neutron_plugin_attribute(self.plugin, 'driver',
@@ -997,7 +1092,6 @@ class NeutronContext(OSContextGenerator):
             flags = config_flags_parser(alchemy_flags)
             ctxt['neutron_alchemy_flags'] = flags
 
-        self._save_flag_file()
         return ctxt
 
 
@@ -1177,7 +1271,7 @@ class SubordinateConfigContext(OSContextGenerator):
                 if sub_config and sub_config != '':
                     try:
                         sub_config = json.loads(sub_config)
-                    except:
+                    except Exception:
                         log('Could not parse JSON from '
                             'subordinate_configuration setting from %s'
                             % rid, level=ERROR)
@@ -1295,11 +1389,12 @@ class WorkerConfigContext(OSContextGenerator):
 class WSGIWorkerConfigContext(WorkerConfigContext):
 
     def __init__(self, name=None, script=None, admin_script=None,
-                 public_script=None, process_weight=1.00,
+                 public_script=None, user=None, group=None,
+                 process_weight=1.00,
                  admin_process_weight=0.25, public_process_weight=0.75):
         self.service_name = name
-        self.user = name
-        self.group = name
+        self.user = user or name
+        self.group = group or name
         self.script = script
         self.admin_script = admin_script
         self.public_script = public_script
@@ -1322,8 +1417,6 @@ class WSGIWorkerConfigContext(WorkerConfigContext):
             "public_processes": int(math.ceil(self.public_process_weight *
                                               total_processes)),
             "threads": 1,
-            "usr_bin": git_determine_usr_bin(),
-            "python_path": git_determine_python_path(),
         }
         return ctxt
 
@@ -1426,6 +1519,10 @@ class NeutronAPIContext(OSContextGenerator):
                 'rel_key': 'enable-qos',
                 'default': False,
             },
+            'enable_nsg_logging': {
+                'rel_key': 'enable-nsg-logging',
+                'default': False,
+            },
         }
         ctxt = self.get_neutron_options({})
         for rid in relation_ids('neutron-plugin-api'):
@@ -1437,10 +1534,15 @@ class NeutronAPIContext(OSContextGenerator):
                 if 'l2-population' in rdata:
                     ctxt.update(self.get_neutron_options(rdata))
 
+        extension_drivers = []
+
         if ctxt['enable_qos']:
-            ctxt['extension_drivers'] = 'qos'
-        else:
-            ctxt['extension_drivers'] = ''
+            extension_drivers.append('qos')
+
+        if ctxt['enable_nsg_logging']:
+            extension_drivers.append('log')
+
+        ctxt['extension_drivers'] = ','.join(extension_drivers)
 
         return ctxt
 
@@ -1569,6 +1671,82 @@ class InternalEndpointContext(OSContextGenerator):
     """
     def __call__(self):
         return {'use_internal_endpoints': config('use-internal-endpoints')}
+
+
+class VolumeAPIContext(InternalEndpointContext):
+    """Volume API context.
+
+    This context provides information regarding the volume endpoint to use
+    when communicating between services. It determines which version of the
+    API is appropriate for use.
+
+    This value will be determined in the resulting context dictionary
+    returned from calling the VolumeAPIContext object. Information provided
+    by this context is as follows:
+
+        volume_api_version: the volume api version to use, currently
+            'v2' or 'v3'
+        volume_catalog_info: the information to use for a cinder client
+            configuration that consumes API endpoints from the keystone
+            catalog. This is defined as the type:name:endpoint_type string.
+    """
+    # FIXME(wolsen) This implementation is based on the provider being able
+    # to specify the package version to check but does not guarantee that the
+    # volume service api version selected is available. In practice, it is
+    # quite likely the volume service *is* providing the v3 volume service.
+    # This should be resolved when the service-discovery spec is implemented.
+    def __init__(self, pkg):
+        """
+        Creates a new VolumeAPIContext for use in determining which version
+        of the Volume API should be used for communication. A package codename
+        should be supplied for determining the currently installed OpenStack
+        version.
+
+        :param pkg: the package codename to use in order to determine the
+            component version (e.g. nova-common). See
+            charmhelpers.contrib.openstack.utils.PACKAGE_CODENAMES for more.
+        """
+        super(VolumeAPIContext, self).__init__()
+        self._ctxt = None
+        if not pkg:
+            raise ValueError('package name must be provided in order to '
+                             'determine current OpenStack version.')
+        self.pkg = pkg
+
+    @property
+    def ctxt(self):
+        if self._ctxt is not None:
+            return self._ctxt
+        self._ctxt = self._determine_ctxt()
+        return self._ctxt
+
+    def _determine_ctxt(self):
+        """Determines the Volume API endpoint information.
+
+        Determines the appropriate version of the API that should be used
+        as well as the catalog_info string that would be supplied. Returns
+        a dict containing the volume_api_version and the volume_catalog_info.
+        """
+        rel = os_release(self.pkg, base='icehouse')
+        version = '2'
+        if CompareOpenStackReleases(rel) >= 'pike':
+            version = '3'
+
+        service_type = 'volumev{version}'.format(version=version)
+        service_name = 'cinderv{version}'.format(version=version)
+        endpoint_type = 'publicURL'
+        if config('use-internal-endpoints'):
+            endpoint_type = 'internalURL'
+        catalog_info = '{type}:{name}:{endpoint}'.format(
+            type=service_type, name=service_name, endpoint=endpoint_type)
+
+        return {
+            'volume_api_version': version,
+            'volume_catalog_info': catalog_info,
+        }
+
+    def __call__(self):
+        return self.ctxt
 
 
 class AppArmorContext(OSContextGenerator):
@@ -1706,3 +1884,51 @@ class MemcacheContext(OSContextGenerator):
                     ctxt['memcache_server_formatted'],
                     ctxt['memcache_port'])
         return ctxt
+
+
+class EnsureDirContext(OSContextGenerator):
+    '''
+    Serves as a generic context to create a directory as a side-effect.
+
+    Useful for software that supports drop-in files (.d) in conjunction
+    with config option-based templates. Examples include:
+        * OpenStack oslo.policy drop-in files;
+        * systemd drop-in config files;
+        * other software that supports overriding defaults with .d files
+
+    Another use-case is when a subordinate generates a configuration for
+    primary to render in a separate directory.
+
+    Some software requires a user to create a target directory to be
+    scanned for drop-in files with a specific format. This is why this
+    context is needed to do that before rendering a template.
+    '''
+
+    def __init__(self, dirname, **kwargs):
+        '''Used merely to ensure that a given directory exists.'''
+        self.dirname = dirname
+        self.kwargs = kwargs
+
+    def __call__(self):
+        mkdir(self.dirname, **self.kwargs)
+        return {}
+
+
+class VersionsContext(OSContextGenerator):
+    """Context to return the openstack and operating system versions.
+
+    """
+    def __init__(self, pkg='python-keystone'):
+        """Initialise context.
+
+        :param pkg: Package to extrapolate openstack version from.
+        :type pkg: str
+        """
+        self.pkg = pkg
+
+    def __call__(self):
+        ostack = os_release(self.pkg, base='icehouse')
+        osystem = lsb_release()['DISTRIB_CODENAME'].lower()
+        return {
+            'openstack_release': ostack,
+            'operating_system_release': osystem}

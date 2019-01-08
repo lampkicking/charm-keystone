@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 #
 # Copyright 2016 Canonical Ltd
 #
@@ -14,24 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import glob
-import grp
-import hashlib
 import json
 import os
-import pwd
-import re
 import shutil
 import subprocess
-import tarfile
-import threading
+import tempfile
 import time
-import urlparse
+import urllib.parse
 import uuid
-import sys
 
 from itertools import chain
-from base64 import b64encode
 from collections import OrderedDict
 from copy import deepcopy
 
@@ -39,7 +31,6 @@ from charmhelpers.contrib.hahelpers.cluster import (
     is_elected_leader,
     determine_api_port,
     https,
-    peer_units,
     get_hacluster_config,
 )
 
@@ -47,6 +38,10 @@ from charmhelpers.contrib.openstack import context, templating
 from charmhelpers.contrib.network.ip import (
     is_ipv6,
     get_ipv6_addr
+)
+
+from charmhelpers.contrib.openstack.ha.utils import (
+    expect_ha,
 )
 
 from charmhelpers.contrib.openstack.ip import (
@@ -60,18 +55,10 @@ from charmhelpers.contrib.openstack.utils import (
     configure_installation_source,
     error_out,
     get_os_codename_install_source,
-    git_clone_and_install,
-    git_default_repos,
-    git_determine_usr_bin,
-    git_install_requested,
-    git_pip_venv_dir,
-    git_src_dir,
-    git_yaml_value,
     os_release,
     save_script_rc as _save_script_rc,
     pause_unit,
     resume_unit,
-    is_unit_paused_set,
     make_assess_status_func,
     os_application_version_set,
     CompareOpenStackReleases,
@@ -80,29 +67,25 @@ from charmhelpers.contrib.openstack.utils import (
     install_os_snaps,
     get_snaps_install_info_from_origin,
     enable_memcache,
+    is_unit_paused_set,
 )
-
-from charmhelpers.contrib.python.packages import (
-    pip_install,
-)
-
-from charmhelpers.core.strutils import (
-    bool_from_string,
-)
-
-import charmhelpers.contrib.unison as unison
 
 from charmhelpers.core.decorators import (
     retry_on_exception,
 )
 
 from charmhelpers.core.hookenv import (
-    charm_dir,
+    atexit,
+    cached,
     config,
+    expected_peer_units,
+    expected_related_units,
+    is_leader,
     leader_get,
     leader_set,
     log,
     local_unit,
+    metadata,
     relation_get,
     relation_set,
     relation_id,
@@ -110,44 +93,38 @@ from charmhelpers.core.hookenv import (
     related_units,
     DEBUG,
     INFO,
-    WARNING,
     ERROR,
-    is_leader,
+    WARNING,
 )
 
 from charmhelpers.fetch import (
     apt_install,
     apt_update,
     apt_upgrade,
+    apt_purge,
+    apt_autoremove,
     add_source,
+    filter_missing_packages,
 )
 
 from charmhelpers.core.host import (
-    adduser,
-    add_group,
-    add_user_to_group,
     mkdir,
+    service_restart,
     service_stop,
     service_start,
-    service_restart,
     pwgen,
     lsb_release,
-    write_file,
     CompareHostReleases,
+    write_file,
 )
 
 from charmhelpers.contrib.peerstorage import (
     peer_store_and_set,
-    peer_store,
-    peer_retrieve,
-    relation_set as relation_set_and_migrate_to_leader,
 )
 
-from charmhelpers.core.templating import render
-
 import keystone_context
-import keystone_ssl as ssl
 
+import uds_comms as uds
 
 TEMPLATES = 'templates/'
 
@@ -160,43 +137,29 @@ BASE_PACKAGES = [
     'python-keystoneclient',
     'python-mysqldb',
     'python-psycopg2',
-    'python-six',
+    'python3-six',
     'pwgen',
-    'unison',
     'uuid',
+]
+
+PY3_PACKAGES = [
+    'python3-keystone',
+    'python3-keystoneclient',
+    'python3-memcache',
+    'python3-six',
+    'libapache2-mod-wsgi-py3',
 ]
 
 BASE_PACKAGES_SNAP = [
     'haproxy',
     'openssl',
-    'python-six',
+    'python3-six',
     'pwgen',
-    'unison',
     'uuid',
 ]
 
 VERSION_PACKAGE = 'keystone'
 
-BASE_GIT_PACKAGES = [
-    'libffi-dev',
-    'libmysqlclient-dev',
-    'libssl-dev',
-    'libxml2-dev',
-    'libxslt1-dev',
-    'libyaml-dev',
-    'python-dev',
-    'python-pip',
-    'python-setuptools',
-    'zlib1g-dev',
-]
-
-# ubuntu packages that should not be installed when deploying from git
-GIT_PACKAGE_BLACKLIST = [
-    'keystone',
-]
-
-
-SSH_USER = 'juju_keystone'
 if snap_install_requested():
     SNAP_BASE_DIR = "/snap/keystone/current"
     SNAP_COMMON_DIR = "/var/snap/keystone/common"
@@ -218,17 +181,9 @@ if snap_install_requested():
     STORED_DEFAULT_DOMAIN_ID = ("{}/keystone.default_domain_id"
                                 "".format(SNAP_LIB_DIR))
     SERVICE_PASSWD_PATH = '{}/services.passwd'.format(SNAP_LIB_DIR)
-
-    SSH_USER_HOME = '/home/{}'.format(SSH_USER)
-    SYNC_FLAGS_DIR = '{}/juju_sync_flags/'.format(SSH_USER_HOME)
-    SYNC_DIR = '{}/juju_sync/'.format(SSH_USER_HOME)
-    SSL_SYNC_ARCHIVE = os.path.join(SYNC_DIR, 'juju-ssl-sync.tar')
-    SSL_DIR = '{}/juju_ssl/'.format(SNAP_LIB_DIR)
-    PKI_CERTS_DIR = os.path.join(SSL_DIR, 'pki')
     POLICY_JSON = ('{}/keystone.conf.d/policy.json'
                    ''.format(SNAP_COMMON_KEYSTONE_DIR))
     BASE_SERVICES = ['snap.keystone.uwsgi', 'snap.keystone.nginx']
-    APACHE_SSL_DIR = '{}/keystone'.format(SSL_DIR)
 else:
     APACHE_SSL_DIR = '/etc/apache2/ssl/keystone'
     KEYSTONE_USER = 'keystone'
@@ -242,12 +197,6 @@ else:
     STORED_ADMIN_DOMAIN_ID = "/var/lib/keystone/keystone.admin_domain_id"
     STORED_DEFAULT_DOMAIN_ID = "/var/lib/keystone/keystone.default_domain_id"
     SERVICE_PASSWD_PATH = '/var/lib/keystone/services.passwd'
-
-    SYNC_FLAGS_DIR = '/var/lib/keystone/juju_sync_flags/'
-    SYNC_DIR = '/var/lib/keystone/juju_sync/'
-    SSL_SYNC_ARCHIVE = os.path.join(SYNC_DIR, 'juju-ssl-sync.tar')
-    SSL_DIR = '/var/lib/keystone/juju_ssl/'
-    PKI_CERTS_DIR = os.path.join(SSL_DIR, 'pki')
     POLICY_JSON = '/etc/keystone/policy.json'
     BASE_SERVICES = [
         'keystone',
@@ -259,16 +208,16 @@ APACHE_CONF = '/etc/apache2/sites-available/openstack_https_frontend'
 APACHE_24_CONF = '/etc/apache2/sites-available/openstack_https_frontend.conf'
 MEMCACHED_CONF = '/etc/memcached.conf'
 
-SSL_CA_NAME = 'Ubuntu Cloud'
 CLUSTER_RES = 'grp_ks_vips'
-CA_CERT_PATH = '/usr/local/share/ca-certificates/keystone_juju_ca_cert.crt'
-SSL_SYNC_SEMAPHORE = threading.Semaphore()
-SSL_DIRS = [SSL_DIR, APACHE_SSL_DIR, CA_CERT_PATH]
 ADMIN_DOMAIN = 'admin_domain'
 ADMIN_PROJECT = 'admin'
 DEFAULT_DOMAIN = 'default'
 SERVICE_DOMAIN = 'service_domain'
 TOKEN_FLUSH_CRON_FILE = '/etc/cron.d/keystone-token-flush'
+KEY_SETUP_FILE = '/etc/keystone/key-setup'
+CREDENTIAL_KEY_REPOSITORY = '/etc/keystone/credential-keys/'
+FERNET_KEY_REPOSITORY = '/etc/keystone/fernet-keys/'
+FERNET_KEY_ROTATE_SYNC_CRON_FILE = '/etc/cron.d/keystone-fernet-rotate-sync'
 WSGI_KEYSTONE_API_CONF = '/etc/apache2/sites-enabled/wsgi-openstack-api.conf'
 UNUSED_APACHE_SITE_FILES = ['/etc/apache2/sites-enabled/keystone.conf',
                             '/etc/apache2/sites-enabled/wsgi-keystone.conf']
@@ -278,12 +227,13 @@ BASE_RESOURCE_MAP = OrderedDict([
         'services': BASE_SERVICES,
         'contexts': [keystone_context.KeystoneContext(),
                      context.SharedDBContext(ssl_dir=KEYSTONE_CONF_DIR),
-                     context.PostgresqlDBContext(),
                      context.SyslogContext(),
                      keystone_context.HAProxyContext(),
                      context.BindHostContext(),
                      context.WorkerConfigContext(),
-                     context.MemcacheContext(package='keystone')],
+                     context.MemcacheContext(package='keystone'),
+                     keystone_context.KeystoneFIDServiceProviderContext(),
+                     keystone_context.WebSSOTrustedDashboardContext()],
     }),
     (KEYSTONE_LOGGER_CONF, {
         'contexts': [keystone_context.KeystoneLoggingContext()],
@@ -299,7 +249,6 @@ BASE_RESOURCE_MAP = OrderedDict([
         'contexts': [keystone_context.KeystoneContext(),
                      keystone_context.NginxSSLContext(),
                      context.SharedDBContext(ssl_dir=KEYSTONE_CONF_DIR),
-                     context.PostgresqlDBContext(),
                      context.SyslogContext(),
                      keystone_context.HAProxyContext(),
                      context.BindHostContext(),
@@ -309,7 +258,6 @@ BASE_RESOURCE_MAP = OrderedDict([
         'services': BASE_SERVICES,
         'contexts': [keystone_context.KeystoneContext(),
                      context.SharedDBContext(ssl_dir=KEYSTONE_CONF_DIR),
-                     context.PostgresqlDBContext(),
                      context.SyslogContext(),
                      keystone_context.HAProxyContext(),
                      keystone_context.NginxSSLContext(),
@@ -330,6 +278,11 @@ BASE_RESOURCE_MAP = OrderedDict([
     }),
     (TOKEN_FLUSH_CRON_FILE, {
         'contexts': [keystone_context.TokenFlushContext(),
+                     context.SyslogContext()],
+        'services': [],
+    }),
+    (FERNET_KEY_ROTATE_SYNC_CRON_FILE, {
+        'contexts': [keystone_context.FernetCronContext(),
                      context.SyslogContext()],
         'services': [],
     }),
@@ -363,6 +316,10 @@ valid_services = {
     "contrail-analytics": {
         "type": "OpServer",
         "desc": "Contrail Analytics Service"
+    },
+    "dmapi": {
+        "type": "datamover",
+        "desc": "Trilio DataMover API Service"
     },
     "ec2": {
         "type": "ec2",
@@ -476,12 +433,16 @@ valid_services = {
         "type": "placement",
         "desc": "Nova Placement Service"
     },
+    "octavia": {
+        "type": "load-balancer",
+        "desc": "Octavia Load Balancer as a Service for OpenStack",
+    },
 }
 
 # The interface is said to be satisfied if anyone of the interfaces in the
 # list has a complete context.
 REQUIRED_INTERFACES = {
-    'database': ['shared-db', 'pgsql-db'],
+    'database': ['shared-db'],
 }
 
 
@@ -495,7 +456,7 @@ def filter_null(settings, null='__null__'):
     so that the value is actually unset.
     """
     filtered = {}
-    for k, v in settings.iteritems():
+    for k, v in settings.items():
         if v == null:
             filtered[k] = None
         else:
@@ -547,16 +508,12 @@ def resource_map():
                     svcs.remove('keystone')
                 if 'apache2' not in svcs:
                     svcs.append('apache2')
-            admin_script = os.path.join(git_determine_usr_bin(),
-                                        "keystone-wsgi-admin")
-            public_script = os.path.join(git_determine_usr_bin(),
-                                         "keystone-wsgi-public")
             resource_map[WSGI_KEYSTONE_API_CONF] = {
                 'contexts': [
                     context.WSGIWorkerConfigContext(
                         name="keystone",
-                        admin_script=admin_script,
-                        public_script=public_script),
+                        admin_script='/usr/bin/keystone-wsgi-admin',
+                        public_script='/usr/bin/keystone-wsgi-public'),
                     keystone_context.KeystoneContext()],
                 'services': ['apache2']
             }
@@ -578,7 +535,8 @@ def restart_pid_check(service_name, ptable_string=None):
     @retry_on_exception(5, base_delay=3, exc_type=AssertionError)
     def check_pids_gone(svc_string):
         log("Checking no pids for {} exist".format(svc_string), level=INFO)
-        assert(subprocess.call(["pgrep", svc_string]) == 1)
+        assert(subprocess.call(["pgrep", svc_string, "--nslist", "pid",
+                               "--ns", str(os.getpid())]) == 1)
 
     if not ptable_string:
         ptable_string = service_name
@@ -626,14 +584,14 @@ def register_configs():
     release = os_release('keystone')
     configs = templating.OSConfigRenderer(templates_dir=TEMPLATES,
                                           openstack_release=release)
-    for cfg, rscs in resource_map().iteritems():
+    for cfg, rscs in resource_map().items():
         configs.register(cfg, rscs['contexts'])
     return configs
 
 
 def restart_map():
     return OrderedDict([(cfg, v['services'])
-                        for cfg, v in resource_map().iteritems()
+                        for cfg, v in resource_map().items()
                         if v['services']])
 
 
@@ -645,7 +603,7 @@ def services():
 def determine_ports():
     """Assemble a list of API ports for services we are managing"""
     ports = [config('admin-port'), config('service-port')]
-    return list(set(ports))
+    return sorted(list(set(ports)))
 
 
 def api_port(service):
@@ -656,6 +614,8 @@ def api_port(service):
 
 
 def determine_packages():
+    release = CompareOpenStackReleases(os_release('keystone'))
+
     # currently all packages match service names
     if snap_install_requested():
         pkgs = deepcopy(BASE_PACKAGES_SNAP)
@@ -664,12 +624,39 @@ def determine_packages():
         return sorted(pkgs)
     else:
         packages = set(services()).union(BASE_PACKAGES)
-        if git_install_requested():
-            packages |= set(BASE_GIT_PACKAGES)
-            packages -= set(GIT_PACKAGE_BLACKLIST)
-        if run_in_apache():
+        if release >= 'rocky':
+            packages = [p for p in packages if not p.startswith('python-')]
+            packages.extend(PY3_PACKAGES)
+        elif run_in_apache():
             packages.add('libapache2-mod-wsgi')
         return sorted(packages)
+
+
+def determine_purge_packages():
+    '''
+    Determine list of packages that where previously installed which are no
+    longer needed.
+
+    :returns: list of package names
+    '''
+    release = CompareOpenStackReleases(os_release('keystone'))
+    if release >= 'rocky':
+        pkgs = [p for p in BASE_PACKAGES if p.startswith('python-')]
+        pkgs.extend(['python-keystone', 'python-memcache'])
+        return pkgs
+    return []
+
+
+def remove_old_packages():
+    '''Purge any packages that need ot be removed.
+
+    :returns: bool Whether packages were removed.
+    '''
+    installed_packages = filter_missing_packages(determine_purge_packages())
+    if installed_packages:
+        apt_purge(installed_packages, fatal=True)
+        apt_autoremove(purge=True, fatal=True)
+    return bool(installed_packages)
 
 
 def save_script_rc():
@@ -685,7 +672,7 @@ def save_script_rc():
 def do_openstack_upgrade_reexec(configs):
     do_openstack_upgrade(configs)
     log("Re-execing hook to pickup upgraded packages", level=INFO)
-    os.execl('./hooks/config-changed-postupgrade', '')
+    os.execl('/usr/bin/env', 'python3', './hooks/config-changed-postupgrade')
 
 
 def do_openstack_upgrade(configs):
@@ -704,6 +691,8 @@ def do_openstack_upgrade(configs):
         reset_os_release()
         apt_install(packages=determine_packages(),
                     options=dpkg_opts, fatal=True)
+
+        remove_old_packages()
     else:
         # TODO: Add support for upgrade from deb->snap
         # NOTE(thedac): Setting devmode until LP#1719636 is fixed
@@ -732,11 +721,9 @@ def do_openstack_upgrade(configs):
 
 
 def is_db_initialised():
-    if relation_ids('cluster'):
-        inited = peer_retrieve('db-initialised')
-        if inited and bool_from_string(inited):
-            log("Database is initialised", level=DEBUG)
-            return True
+    if leader_get('db-initialised'):
+        log("Database is initialised", level=DEBUG)
+        return True
 
     log("Database is NOT initialised", level=DEBUG)
     return False
@@ -773,7 +760,7 @@ def migrate_database():
     else:
         service_start(keystone_service())
     time.sleep(10)
-    peer_store('db-initialised', 'True')
+    leader_set({'db-initialised': True})
 
 # OLD
 
@@ -852,29 +839,31 @@ def delete_service_entry(service_name, service_type):
     manager = get_manager()
     service_id = manager.resolve_service_id(service_name, service_type)
     if service_id:
-        manager.api.services.delete(service_id)
-        log("Deleted service entry '%s'" % service_name, level=DEBUG)
+        manager.delete_service_by_id(service_id)
+        log("Deleted service entry '{}'".format(service_name), level=DEBUG)
 
 
 def create_service_entry(service_name, service_type, service_desc, owner=None):
     """ Add a new service entry to keystone if one does not already exist """
     manager = get_manager()
-    for service in [s._info for s in manager.api.services.list()]:
+    for service in manager.list_services():
         if service['name'] == service_name:
-            log("Service entry for '%s' already exists." % service_name,
+            log("Service entry for '{}' already exists.".format(service_name),
                 level=DEBUG)
             return
 
-    manager.api.services.create(service_name,
-                                service_type,
-                                description=service_desc)
-    log("Created new service entry '%s'" % service_name, level=DEBUG)
+    manager.create_service(service_name, service_type,
+                           description=service_desc)
+
+    log("Created new service entry '{}'".format(service_name), level=DEBUG)
 
 
 def create_endpoint_template(region, service, publicurl, adminurl,
                              internalurl):
     manager = get_manager()
-    if manager.api_version == 2:
+    # this needs to be a round-trip to the manager.py script to discover what
+    # the "current" api_version might be, as it can't just be asserted.
+    if manager.resolved_api_version() == 2:
         create_endpoint_template_v2(manager, region, service, publicurl,
                                     adminurl, internalurl)
     else:
@@ -887,7 +876,7 @@ def create_endpoint_template_v2(manager, region, service, publicurl, adminurl,
     """ Create a new endpoint template for service if one does not already
         exist matching name *and* region """
     service_id = manager.resolve_service_id(service)
-    for ep in [e._info for e in manager.api.endpoints.list()]:
+    for ep in manager.list_endpoints():
         if ep['service_id'] == service_id and ep['region'] == region:
             log("Endpoint template already exists for '%s' in '%s'"
                 % (service, region))
@@ -902,15 +891,15 @@ def create_endpoint_template_v2(manager, region, service, publicurl, adminurl,
             else:
                 # delete endpoint and recreate if endpoint urls need updating.
                 log("Updating endpoint template with new endpoint urls.")
-                manager.api.endpoints.delete(ep['id'])
+                manager.delete_endpoint_by_id(ep['id'])
 
     manager.create_endpoints(region=region,
                              service_id=service_id,
                              publicurl=publicurl,
                              adminurl=adminurl,
                              internalurl=internalurl)
-    log("Created new endpoint template for '%s' in '%s'" % (region, service),
-        level=DEBUG)
+    log("Created new endpoint template for '{}' in '{}'"
+        .format(region, service), level=DEBUG)
 
 
 def create_endpoint_template_v3(manager, region, service, publicurl, adminurl,
@@ -935,11 +924,11 @@ def create_endpoint_template_v3(manager, region, service, publicurl, adminurl,
             region
         )
         if ep_deleted or not ep_exists:
-            manager.api.endpoints.create(
-                service_id,
-                endpoints[ep_type],
+            manager.create_endpoint_by_type(
+                region=region,
+                service_id=service_id,
                 interface=ep_type,
-                region=region
+                endpoint=endpoints[ep_type],
             )
 
 
@@ -951,11 +940,11 @@ def create_tenant(name, domain):
         manager.create_tenant(tenant_name=name,
                               domain=domain,
                               description='Created by Juju')
-        log("Created new tenant '%s' in domain '%s'" % (name, domain),
+        log("Created new tenant '{}' in domain '{}'".format(name, domain),
             level=DEBUG)
         return
 
-    log("Tenant '%s' already exists." % name, level=DEBUG)
+    log("Tenant '{}' already exists.".format(name), level=DEBUG)
 
 
 def create_or_show_domain(name):
@@ -963,88 +952,217 @@ def create_or_show_domain(name):
     manager = get_manager()
     domain_id = manager.resolve_domain_id(name)
     if domain_id:
-        log("Domain '%s' already exists." % name, level=DEBUG)
+        log("Domain '{}' already exists.".format(name), level=DEBUG)
     else:
         manager.create_domain(domain_name=name,
                               description='Created by Juju')
-        log("Created new domain: %s" % name, level=DEBUG)
+        log("Created new domain: {}".format(name), level=DEBUG)
         domain_id = manager.resolve_domain_id(name)
     return domain_id
 
 
 def user_exists(name, domain=None):
     manager = get_manager()
-    domain_id = None
-    if domain:
-        domain_id = manager.resolve_domain_id(domain)
-        if not domain_id:
-            error_out('Could not resolve domain_id for {} when checking if '
-                      ' user {} exists'.format(domain, name))
-    if manager.resolve_user_id(name, user_domain=domain):
-        if manager.api_version == 2:
-            users = manager.api.users.list()
-        else:
-            users = manager.api.users.list(domain=domain_id)
-        for user in users:
-            if user.name.lower() == name.lower():
-                # In v3 Domains are seperate user namespaces so need to check
-                # that the domain matched if provided
-                if domain:
-                    if domain_id == user.domain_id:
-                        return True
-                else:
-                    return True
-
-    return False
+    return manager.user_exists(name, domain=domain)
 
 
 def create_user(name, password, tenant=None, domain=None):
     """Creates a user if it doesn't already exist, as a member of tenant"""
     manager = get_manager()
     if user_exists(name, domain=domain):
-        log("A user named '%s' already exists in domain '%s'" % (name, domain),
-            level=DEBUG)
+        log("A user named '{}' already exists in domain '{}'"
+            .format(name, domain), level=DEBUG)
         return
 
     tenant_id = None
     if tenant:
         tenant_id = manager.resolve_tenant_id(tenant, domain=domain)
         if not tenant_id:
-            error_out("Could not resolve tenant_id for tenant '%s' in domain "
-                      "'%s'" % (tenant, domain))
+            error_out("Could not resolve tenant_id for tenant '{}' in domain "
+                      "'{}'".format(tenant, domain))
 
     domain_id = None
     if domain:
         domain_id = manager.resolve_domain_id(domain)
         if not domain_id:
-            error_out('Could not resolve domain_id for domain %s when creating'
-                      ' user %s' % (domain, name))
+            error_out('Could not resolve domain_id for domain {} when creating'
+                      ' user {}'.format(domain, name))
 
     manager.create_user(name=name,
                         password=password,
                         email='juju@localhost',
                         tenant_id=tenant_id,
                         domain_id=domain_id)
-    log("Created new user '%s' tenant: '%s' domain: '%s'" % (name, tenant_id,
-        domain_id), level=DEBUG)
+    log("Created new user '{}' tenant: '{}' domain: '{}'"
+        .format(name, tenant_id, domain_id), level=DEBUG)
 
 
 def get_manager(api_version=None):
-    """Return a keystonemanager for the correct API version"""
-    set_python_path()
-    from manager import get_keystone_manager
-    return get_keystone_manager(get_local_endpoint(), get_admin_token(),
-                                api_version)
+    return KeystoneManagerProxy(api_version=api_version)
+
+
+class KeystoneManagerProxy(object):
+
+    def __init__(self, api_version=None, path=None):
+        self._path = path or []
+        self.api_version = api_version
+
+    def __getattribute__(self, attr):
+        if attr in ['__class__', '_path', 'api_version']:
+            return super().__getattribute__(attr)
+        return self.__class__(api_version=self.api_version,
+                              path=self._path + [attr])
+
+    def __call__(self, *args, **kwargs):
+        # Following line retained commented-out for future debugging
+        # print("Called: {} ({}, {})".format(self._path, args, kwargs))
+        return _proxy_manager_call(self._path, self.api_version, args, kwargs)
+
+
+JSON_ENCODE_OPTIONS = dict(
+    sort_keys=True,
+    allow_nan=False,
+    indent=None,
+    separators=(',', ':'),
+)
+
+
+def _proxy_manager_call(path, api_version, args, kwargs):
+    package = dict(path=path,
+                   api_version=api_version,
+                   api_local_endpoint=get_local_endpoint(),
+                   admin_token=get_admin_token(),
+                   args=args,
+                   kwargs=kwargs)
+    serialized = json.dumps(package, **JSON_ENCODE_OPTIONS)
+    server = _get_server_instance()
+    try:
+        server.send(serialized)
+        # wait for the reply
+        result_str = server.receive()
+        result = json.loads(result_str)
+        if 'error' in result:
+            s = ("The call within manager.py failed with the error: '{}'. "
+                 "The call was: path={}, args={}, kwargs={}, api_version={}"
+                 .format(result['error'], path, args, kwargs, api_version))
+            log(s, level=ERROR)
+            raise RuntimeError(s)
+        return json.loads(result_str)['result']
+    except RuntimeError as e:
+        raise e
+    except Exception as e:
+        s = ("Decoding the result from the call to manager.py resulted in "
+             "error '{}' (command: path={}, args={}, kwargs={}"
+             .format(str(e), path, args, kwargs))
+        log(s, level=ERROR)
+        raise RuntimeError(s)
+
+
+# singleton to ensure that there's only one manager instance.
+_the_manager_instance = None
+
+
+def _get_server_instance():
+    """Get a SockServer instance and run up the manager to connect to it.
+    Ensure that the manager.py is running and is ready to receive messages (i.e
+    do the handshake.  Check that it is still running, and if not, start it
+    again.  In that instance, restart the SockServer
+    """
+    global _the_manager_instance
+    if _the_manager_instance is None:
+        _the_manager_instance = ManagerServer()
+    return _the_manager_instance.server
+
+
+class ManagerServer():
+    """This is a singleton server that launches and kills the manager.py script
+    that is used to allow 'calling' into Keystone when it is in a completely
+    different process.  The object handles kill/quiting the manager.py script
+    when this keystone charm exits using the atexit charmhelpers `atexit()`
+    command to do the cleanup.
+
+    The server() method also ensures that the manager.py script is still
+    running, and if not, relaunches it.  This is to try to make the using the
+    manager.py methods as transparent, and speedy, as possible.
+    """
+
+    def __init__(self):
+        self.pvar = None
+        self._server = None
+        self.socket_file = os.path.join(tempfile.gettempdir(), "keystone-uds")
+        atexit(lambda: self.clean_up())
+
+    @property
+    def server(self):
+        self._ensure_running()
+        return self._server
+
+    def _ensure_running(self):
+        if self.pvar is None or self.pvar.poll() is not None:
+            if self._server is not None:
+                self._server.close()
+            self._server = uds.UDSServer(self.socket_file)
+            self._launch_manager()
+            self._server.wait_for_connection()
+
+    def _launch_manager(self):
+        script = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                              'manager.py'))
+        release = CompareOpenStackReleases(
+            get_os_codename_install_source(config('openstack-origin'))
+        )
+        # need to set the environment variable PYTHONPATH to include the
+        # payload's directory for the manager.py to find the various keystone
+        # clients
+        env = os.environ
+        _python_path = determine_python_path()
+        if _python_path:
+            if _python_path not in os.environ.get('PYTHONPATH', ''):
+                env['PYTHONPATH'] = ':'.join(
+                    os.environ.get('PYTHONPATH', '').split(':') +
+                    [_python_path])
+        # also ensure that the python executable is available if snap
+        # installed.
+        if snap_install_requested():
+            _bin_path = os.path.join(SNAP_BASE_DIR, 'usr/bin')
+            if _bin_path not in os.environ.get('PATH', ''):
+                env['PATH'] = ':'.join(
+                    os.environ.get('PATH', '').split(':') +
+                    [_bin_path])
+        # ensure python interpreter matches python version of OpenStack
+        if release >= 'rocky':
+            python = 'python3'
+        else:
+            python = 'python2'
+        # launch the process and return immediately
+        self.pvar = subprocess.Popen([python, script, self.socket_file],
+                                     env=env, close_fds=True)
+
+    def clean_up(self):
+        if self.pvar is not None and self.pvar.poll() is None:
+            self._server.send("QUIT")
+            try:
+                self.pvar.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.pvar.kill()
+            self.pvar = None
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+        try:
+            os.remove(self.socket_file)
+        except OSError:
+            pass
 
 
 def create_role(name, user=None, tenant=None, domain=None):
     """Creates a role if it doesn't already exist. grants role to user"""
     manager = get_manager()
     if not manager.resolve_role_id(name):
-        manager.api.roles.create(name=name)
-        log("Created new role '%s'" % name, level=DEBUG)
+        manager.create_role(name=name)
+        log("Created new role '{}'".format(name), level=DEBUG)
     else:
-        log("A role named '%s' already exists" % name, level=DEBUG)
+        log("A role named '{}' already exists".format(name), level=DEBUG)
 
     if not user and not tenant:
         return
@@ -1083,8 +1201,8 @@ def grant_role(user, role, tenant=None, domain=None, user_domain=None,
     if tenant:
         tenant_id = manager.resolve_tenant_id(tenant, domain=project_domain)
         if not tenant_id:
-            error_out("Could not resolve tenant_id for tenant '%s' in domain "
-                      "'%s'" % (tenant, domain))
+            error_out("Could not resolve tenant_id for tenant '{}' in domain "
+                      "'{}'".format(tenant, domain))
 
     domain_id = None
     if domain:
@@ -1094,7 +1212,7 @@ def grant_role(user, role, tenant=None, domain=None, user_domain=None,
 
     cur_roles = manager.roles_for_user(user_id, tenant_id=tenant_id,
                                        domain_id=domain_id)
-    if not cur_roles or role_id not in [r.id for r in cur_roles]:
+    if not cur_roles or role_id not in [r['id'] for r in cur_roles]:
         manager.add_user_role(user=user_id,
                               role=role_id,
                               tenant=tenant_id,
@@ -1116,71 +1234,58 @@ def grant_role(user, role, tenant=None, domain=None, user_domain=None,
 
 def store_data(backing_file, data):
     with open(backing_file, 'w+') as fd:
-        fd.writelines("%s\n" % data)
+        fd.writelines("{}\n".format(data))
 
 
 def get_admin_passwd(user=None):
     passwd = config("admin-password")
     if passwd and passwd.lower() != "none":
-        # Previous charm versions did not always store on leader setting so do
-        # this now to avoid an initial update on install/upgrade
-        if (is_elected_leader(CLUSTER_RES) and
-                peer_retrieve('{}_passwd'.format(user)) is None):
-            set_admin_passwd(passwd, user=user)
-
         return passwd
 
-    _migrate_admin_password()
-    passwd = peer_retrieve('{}_passwd'.format(user))
+    if user is None:
+        user = config('admin-user')
 
-    if not passwd and is_elected_leader(CLUSTER_RES):
-        log("Generating new passwd for user: %s" %
-            config("admin-user"))
+    _migrate_admin_password()
+    passwd = leader_get('{}_passwd'.format(user))
+
+    if not passwd and is_leader():
+        log("Generating new passwd for user: %s" % user)
         cmd = ['pwgen', '-c', '16', '1']
-        passwd = str(subprocess.check_output(cmd)).strip()
+        passwd = str(subprocess.check_output(cmd).decode('UTF-8')).strip()
 
     return passwd
 
 
 def set_admin_passwd(passwd, user=None):
     if user is None:
-        user = 'admin'
+        user = config('admin-user')
 
-    peer_store('{}_passwd'.format(user), passwd)
+    leader_set({'{}_passwd'.format(user): passwd})
 
 
 def get_api_version():
     api_version = config('preferred-api-version')
-    if api_version not in [2, 3]:
+    cmp_release = CompareOpenStackReleases(
+        get_os_codename_install_source(config('openstack-origin'))
+    )
+    if not api_version:
+        # NOTE(jamespage): Queens dropped support for v2, so default
+        #                  to v3.
+        if cmp_release >= 'queens':
+            api_version = 3
+        else:
+            api_version = 2
+    if ((cmp_release < 'queens' and api_version not in [2, 3]) or
+            (cmp_release >= 'queens' and api_version != 3)):
         raise ValueError('Bad preferred-api-version')
     return api_version
-
-
-def set_python_path():
-    """ Set the Python path to include snap installed python libraries
-
-    The charm itself requires access to the python client. When installed as a
-    snap the client libraries are in /snap/$SNAP/common/lib/python2.7. This
-    function sets the python path to allow clients to be imported from snap
-    installs.
-    """
-    if snap_install_requested():
-        sys.path.append(determine_python_path())
 
 
 def ensure_initial_admin(config):
     # Allow retry on fail since leader may not be ready yet.
     # NOTE(hopem): ks client may not be installed at module import time so we
     # use this wrapped approach instead.
-    set_python_path()
-    try:
-        from keystoneclient.apiclient.exceptions import InternalServerError
-    except:
-        # Backwards-compatibility for earlier versions of keystoneclient (< I)
-        from keystoneclient.exceptions import (ClientException as
-                                               InternalServerError)
-
-    @retry_on_exception(3, base_delay=3, exc_type=InternalServerError)
+    @retry_on_exception(3, base_delay=3, exc_type=RuntimeError)
     def _ensure_initial_admin(config):
         """Ensures the minimum admin stuff exists in whatever database we're
         using.
@@ -1261,9 +1366,9 @@ def endpoint_url(ip, port, suffix=None):
     if is_ipv6(ip):
         ip = "[{}]".format(ip)
     if suffix:
-        ep = "%s://%s:%s/%s" % (proto, ip, port, suffix)
+        ep = "{}://{}:{}/{}".format(proto, ip, port, suffix)
     else:
-        ep = "%s://%s:%s" % (proto, ip, port)
+        ep = "{}://{}:{}".format(proto, ip, port)
     return ep
 
 
@@ -1280,15 +1385,14 @@ def create_keystone_endpoint(public_ip, service_port,
 
 def update_user_password(username, password, domain):
     manager = get_manager()
-    log("Updating password for user '%s'" % username)
+    log("Updating password for user '{}'".format(username))
 
     user_id = manager.resolve_user_id(username, user_domain=domain)
     if user_id is None:
-        error_out("Could not resolve user id for '%s'" % username)
+        error_out("Could not resolve user id for '{}'".format(username))
 
     manager.update_password(user=user_id, password=password)
-    log("Successfully updated password for user '%s'" %
-        username)
+    log("Successfully updated password for user '{}'".format(username))
 
 
 def load_stored_passwords(path=SERVICE_PASSWD_PATH):
@@ -1304,29 +1408,28 @@ def load_stored_passwords(path=SERVICE_PASSWD_PATH):
 
 
 def _migrate_admin_password():
-    """Migrate on-disk admin passwords to peer storage"""
-    if os.path.exists(STORED_PASSWD):
-        log('Migrating on-disk stored passwords to peer storage')
+    """Migrate on-disk admin passwords to leader storage"""
+    if is_leader() and os.path.exists(STORED_PASSWD):
+        log('Migrating on-disk stored passwords to leader storage')
         with open(STORED_PASSWD) as fd:
-            peer_store("admin_passwd", fd.readline().strip('\n'))
+            leader_set({"admin_passwd": fd.readline().strip('\n')})
 
         os.unlink(STORED_PASSWD)
 
 
 def _migrate_service_passwords():
-    """Migrate on-disk service passwords to peer storage"""
-    if os.path.exists(SERVICE_PASSWD_PATH):
-        log('Migrating on-disk stored passwords to peer storage')
+    """Migrate on-disk service passwords to leader storage"""
+    if is_leader() and os.path.exists(SERVICE_PASSWD_PATH):
+        log('Migrating on-disk stored passwords to leader storage')
         creds = load_stored_passwords()
-        for k, v in creds.iteritems():
-            peer_store(key="{}_passwd".format(k), value=v)
+        for k, v in creds.items():
+            leader_set({"{}_passwd".format(k): v})
         os.unlink(SERVICE_PASSWD_PATH)
 
 
 def get_service_password(service_username):
     _migrate_service_passwords()
-    peer_key = "{}_passwd".format(service_username)
-    passwd = peer_retrieve(peer_key)
+    passwd = leader_get("{}_passwd".format(service_username))
     if passwd is None:
         passwd = pwgen(length=64)
 
@@ -1334,612 +1437,12 @@ def get_service_password(service_username):
 
 
 def set_service_password(passwd, user):
-    peer_key = "{}_passwd".format(user)
-    peer_store(key=peer_key, value=passwd)
+    leader_set({"{}_passwd".format(user): passwd})
 
 
 def is_password_changed(username, passwd):
-    peer_key = "{}_passwd".format(username)
-    _passwd = peer_retrieve(peer_key)
+    _passwd = leader_get("{}_passwd".format(username))
     return (_passwd is None or passwd != _passwd)
-
-
-def ensure_ssl_dirs():
-    """Ensure unison has access to these dirs."""
-    for path in [SYNC_FLAGS_DIR, SYNC_DIR]:
-        if not os.path.isdir(path):
-            mkdir(path, SSH_USER, KEYSTONE_USER, 0o775)
-        else:
-            ensure_permissions(path, user=SSH_USER, group=KEYSTONE_USER,
-                               perms=0o775)
-
-
-def ensure_permissions(path, user=None, group=None, perms=None, recurse=False,
-                       maxdepth=50):
-    """Set chownand chmod for path
-
-    Note that -1 for uid or gid result in no change.
-    """
-    if user:
-        uid = pwd.getpwnam(user).pw_uid
-    else:
-        uid = -1
-
-    if group:
-        gid = grp.getgrnam(group).gr_gid
-    else:
-        gid = -1
-
-    os.chown(path, uid, gid)
-
-    if perms:
-        os.chmod(path, perms)
-
-    if recurse:
-        if not maxdepth:
-            log("Max recursion depth reached - skipping further recursion")
-            return
-
-        paths = glob.glob("%s/*" % (path))
-        for path in paths:
-            ensure_permissions(path, user=user, group=group, perms=perms,
-                               recurse=recurse, maxdepth=maxdepth - 1)
-
-
-def check_peer_actions():
-    """Honour service action requests from sync master.
-
-    Check for service action request flags, perform the action then delete the
-    flag.
-    """
-    restart = relation_get(attribute='restart-services-trigger')
-    if restart and os.path.isdir(SYNC_FLAGS_DIR):
-        for flagfile in glob.glob(os.path.join(SYNC_FLAGS_DIR, '*')):
-            flag = os.path.basename(flagfile)
-            key = re.compile("^(.+)?\.(.+)?\.(.+)")
-            res = re.search(key, flag)
-            if res:
-                source = res.group(1)
-                service = res.group(2)
-                action = res.group(3)
-            else:
-                key = re.compile("^(.+)?\.(.+)?")
-                res = re.search(key, flag)
-                source = res.group(1)
-                action = res.group(2)
-
-            # Don't execute actions requested by this unit.
-            if local_unit().replace('.', '-') != source:
-                if action == 'restart':
-                    log("Running action='%s' on service '%s'" %
-                        (action, service), level=DEBUG)
-                    service_restart(service)
-                elif action == 'start':
-                    log("Running action='%s' on service '%s'" %
-                        (action, service), level=DEBUG)
-                    service_start(service)
-                elif action == 'stop':
-                    log("Running action='%s' on service '%s'" %
-                        (action, service), level=DEBUG)
-                    service_stop(service)
-                elif action == 'update-ca-certificates':
-                    log("Running %s" % (action), level=DEBUG)
-                    subprocess.check_call(['update-ca-certificates'])
-                elif action == 'ensure-pki-permissions':
-                    log("Running %s" % (action), level=DEBUG)
-                    ensure_pki_dir_permissions()
-                else:
-                    log("Unknown action flag=%s" % (flag), level=WARNING)
-
-            try:
-                os.remove(flagfile)
-            except:
-                pass
-
-
-def create_peer_service_actions(action, services):
-    """Mark remote services for action.
-
-    Default action is restart. These action will be picked up by peer units
-    e.g. we may need to restart services on peer units after certs have been
-    synced.
-    """
-    for service in services:
-        flagfile = os.path.join(SYNC_FLAGS_DIR, '%s.%s.%s' %
-                                (local_unit().replace('/', '-'),
-                                 service.strip(), action))
-        log("Creating action %s" % (flagfile), level=DEBUG)
-        write_file(flagfile, content='', owner=SSH_USER, group=KEYSTONE_USER,
-                   perms=0o744)
-
-
-def create_peer_actions(actions):
-    for action in actions:
-        action = "%s.%s" % (local_unit().replace('/', '-'), action)
-        flagfile = os.path.join(SYNC_FLAGS_DIR, action)
-        log("Creating action %s" % (flagfile), level=DEBUG)
-        write_file(flagfile, content='', owner=SSH_USER, group=KEYSTONE_USER,
-                   perms=0o744)
-
-
-@retry_on_exception(3, base_delay=2, exc_type=subprocess.CalledProcessError)
-def unison_sync(paths_to_sync):
-    """Do unison sync and retry a few times if it fails since peers may not be
-    ready for sync.
-
-    Returns list of synced units or None if one or more peers was not synced.
-    """
-    log('Synchronizing CA (%s) to all peers.' % (', '.join(paths_to_sync)),
-        level=INFO)
-    keystone_gid = grp.getgrnam(KEYSTONE_USER).gr_gid
-
-    # NOTE(dosaboy): This will sync to all peers who have already provided
-    # their ssh keys. If any existing peers have not provided their keys yet,
-    # they will be silently ignored.
-    unison.sync_to_peers(peer_interface='cluster', paths=paths_to_sync,
-                         user=SSH_USER, verbose=True, gid=keystone_gid,
-                         fatal=True)
-
-    synced_units = peer_units()
-    if len(unison.collect_authed_hosts('cluster')) != len(synced_units):
-        log("Not all peer units synced due to missing public keys", level=INFO)
-        return None
-    else:
-        return synced_units
-
-
-def get_ssl_sync_request_units():
-    """Get list of units that have requested to be synced.
-
-    NOTE: this must be called from cluster relation context.
-    """
-    units = []
-    for unit in related_units():
-        settings = relation_get(unit=unit) or {}
-        rkeys = settings.keys()
-        key = re.compile("^ssl-sync-required-(.+)")
-        for rkey in rkeys:
-            res = re.search(key, rkey)
-            if res:
-                units.append(res.group(1))
-
-    return units
-
-
-def is_ssl_cert_master(votes=None):
-    """Return True if this unit is ssl cert master."""
-
-    votes = votes or get_ssl_cert_master_votes()
-    set_votes = set(votes)
-    # Discard unknown votes
-    if 'unknown' in set_votes:
-        set_votes.remove('unknown')
-
-    # This is the elected ssl-cert-master leader
-    if len(set_votes) == 1 and set_votes == set([local_unit()]):
-        log("This unit is the elected ssl-cert-master "
-            "{}".format(votes), level=DEBUG)
-        return True
-
-    # Contested election
-    if len(set_votes) > 1:
-        log("Did not get consensus from peers on who is ssl-cert-master "
-            "{}".format(votes), level=DEBUG)
-        return False
-
-    # Neither the elected ssl-cert-master leader nor the juju leader
-    if not is_leader():
-        return False
-    # Only the juju elected leader continues
-
-    # Singleton
-    if not peer_units():
-        log("This unit is a singleton and thefore ssl-cert-master",
-            level=DEBUG)
-        return True
-
-    # Early in the process and juju leader
-    if not set_votes:
-        log("This unit is the juju leader and there are no votes yet, "
-            "becoming the ssl-cert-master",
-            level=DEBUG)
-        return True
-    elif (len(set_votes) == 1 and set_votes != set([local_unit()]) and
-            is_leader()):
-        log("This unit is the juju leader but not yet ssl-cert-master "
-            "(current votes = {})".format(set_votes), level=DEBUG)
-        return False
-
-    # Should never reach here
-    log("Could not determine the ssl-cert-master. Missing edge case. "
-        "(current votes = {})".format(set_votes),
-        level=ERROR)
-    return False
-
-
-def get_ssl_cert_master_votes():
-    """Returns a list of unique votes."""
-    votes = []
-    # Gather election results from peers. These will need to be consistent.
-    for rid in relation_ids('cluster'):
-        for unit in related_units(rid):
-            m = relation_get(rid=rid, unit=unit,
-                             attribute='ssl-cert-master')
-            if m is not None:
-                votes.append(m)
-
-    return list(set(votes))
-
-
-def ensure_ssl_cert_master():
-    """Ensure that an ssl cert master has been elected.
-
-    Normally the cluster leader will take control but we allow for this to be
-    ignored since this could be called before the cluster is ready.
-    """
-    master_override = False
-    elect = is_elected_leader(CLUSTER_RES)
-
-    # If no peers we allow this unit to elect itsef as master and do
-    # sync immediately.
-    if not peer_units():
-        elect = True
-        master_override = True
-
-    if elect:
-        votes = get_ssl_cert_master_votes()
-        # We expect all peers to echo this setting
-        if not votes or 'unknown' in votes:
-            log("Notifying peers this unit is ssl-cert-master", level=INFO)
-            for rid in relation_ids('cluster'):
-                settings = {'ssl-cert-master': local_unit()}
-                relation_set(relation_id=rid, relation_settings=settings)
-
-            # Return now and wait for cluster-relation-changed (peer_echo) for
-            # sync.
-            return master_override
-        elif not is_ssl_cert_master(votes):
-            if not master_override:
-                log("Conscensus not reached - current master will need to "
-                    "release", level=INFO)
-
-            return master_override
-
-    if not is_ssl_cert_master():
-        log("Not ssl cert master - skipping sync", level=INFO)
-        return False
-
-    return True
-
-
-def stage_paths_for_sync(paths):
-    shutil.rmtree(SYNC_DIR)
-    ensure_ssl_dirs()
-    with tarfile.open(SSL_SYNC_ARCHIVE, 'w') as fd:
-        for path in paths:
-            if os.path.exists(path):
-                log("Adding path '%s' sync tarball" % (path), level=DEBUG)
-                fd.add(path)
-            else:
-                log("Path '%s' does not exist - not adding to sync "
-                    "tarball" % (path), level=INFO)
-
-    ensure_permissions(SYNC_DIR, user=SSH_USER, group=KEYSTONE_USER,
-                       perms=0o775, recurse=True)
-
-
-def is_pki_enabled():
-    enable_pki = config('enable-pki')
-    if enable_pki and bool_from_string(enable_pki):
-        return True
-
-    return False
-
-
-def ensure_pki_cert_paths():
-    certs = os.path.join(PKI_CERTS_DIR, 'certs')
-    privates = os.path.join(PKI_CERTS_DIR, 'privates')
-    not_exists = [p for p in [PKI_CERTS_DIR, certs, privates]
-                  if not os.path.exists(p)]
-    if not_exists:
-        log("Configuring token signing cert paths", level=DEBUG)
-        perms = 0o775
-        for path in not_exists:
-            if not os.path.isdir(path):
-                mkdir(path=path, owner=SSH_USER, group=KEYSTONE_USER,
-                      perms=perms)
-            else:
-                # Ensure accessible by ssh user and group (for sync).
-                ensure_permissions(path, user=SSH_USER, group=KEYSTONE_USER,
-                                   perms=perms)
-
-
-def ensure_pki_dir_permissions():
-    # Ensure accessible by unison user and group (for sync).
-    ensure_permissions(PKI_CERTS_DIR, user=SSH_USER, group=KEYSTONE_USER,
-                       perms=0o775, recurse=True)
-
-
-def update_certs_if_available(f):
-    def _inner_update_certs_if_available(*args, **kwargs):
-        path = None
-        for rid in relation_ids('cluster'):
-            path = relation_get(attribute='ssl-cert-available-updates',
-                                rid=rid, unit=local_unit())
-
-        if path and os.path.exists(path):
-            log("Updating certs from '%s'" % (path), level=DEBUG)
-            with tarfile.open(path) as fd:
-                files = ["/%s" % m.name for m in fd.getmembers()]
-                fd.extractall(path='/')
-
-            for syncfile in files:
-                ensure_permissions(syncfile, user=KEYSTONE_USER,
-                                   group=KEYSTONE_USER,
-                                   perms=0o744, recurse=True)
-
-            # Mark as complete
-            os.rename(path, "%s.complete" % (path))
-        else:
-            log("No cert updates available", level=DEBUG)
-
-        return f(*args, **kwargs)
-
-    return _inner_update_certs_if_available
-
-
-def synchronize_ca(fatal=False):
-    """Broadcast service credentials to peers.
-
-    By default a failure to sync is fatal and will result in a raised
-    exception.
-
-    This function uses a relation setting 'ssl-cert-master' to get some
-    leader stickiness while synchronisation is being carried out. This ensures
-    that the last host to create and broadcast cetificates has the option to
-    complete actions before electing the new leader as sync master.
-
-    Returns a dictionary of settings to be set on the cluster relation.
-    """
-    paths_to_sync = []
-    peer_service_actions = {'restart': []}
-    peer_actions = []
-
-    if bool_from_string(config('https-service-endpoints')):
-        log("Syncing all endpoint certs since https-service-endpoints=True",
-            level=DEBUG)
-        paths_to_sync.append(SSL_DIR)
-        paths_to_sync.append(CA_CERT_PATH)
-        # We need to restart peer apache services to ensure they have picked up
-        # new ssl keys.
-        peer_service_actions['restart'].append('apache2')
-        peer_actions.append('update-ca-certificates')
-
-    if bool_from_string(config('use-https')):
-        log("Syncing keystone-endpoint certs since use-https=True",
-            level=DEBUG)
-        paths_to_sync.append(SSL_DIR)
-        paths_to_sync.append(APACHE_SSL_DIR)
-        paths_to_sync.append(CA_CERT_PATH)
-        # We need to restart peer apache services to ensure they have picked up
-        # new ssl keys.
-        peer_service_actions['restart'].append('apache2')
-        peer_actions.append('update-ca-certificates')
-
-    # NOTE: certs needed for token signing e.g. pki and revocation list query.
-    log("Syncing token certs", level=DEBUG)
-    paths_to_sync.append(PKI_CERTS_DIR)
-    peer_actions.append('ensure-pki-permissions')
-
-    if not paths_to_sync:
-        log("Nothing to sync - skipping", level=DEBUG)
-        return {}
-
-    if not os.path.isdir(SYNC_FLAGS_DIR):
-        mkdir(SYNC_FLAGS_DIR, SSH_USER, KEYSTONE_USER, 0o775)
-
-    restart_trigger = None
-    for action, services in peer_service_actions.iteritems():
-        services = set(services)
-        if services:
-            restart_trigger = str(uuid.uuid4())
-            create_peer_service_actions(action, services)
-
-    create_peer_actions(peer_actions)
-
-    paths_to_sync = list(set(paths_to_sync))
-    stage_paths_for_sync(paths_to_sync)
-
-    hash1 = hashlib.sha256()
-    for path in paths_to_sync:
-        update_hash_from_path(hash1, path)
-
-    cluster_rel_settings = {'ssl-cert-available-updates': SSL_SYNC_ARCHIVE,
-                            'sync-hash': hash1.hexdigest()}
-
-    synced_units = unison_sync([SSL_SYNC_ARCHIVE, SYNC_FLAGS_DIR])
-    if synced_units:
-        # Format here needs to match that used when peers request sync
-        synced_units = [u.replace('/', '-') for u in synced_units]
-        ssl_synced_units = \
-            json.dumps(synced_units)
-        # NOTE(hopem): we pull this onto the leader settings to avoid
-        # unnecessary cluster relation noise. This is possible because the
-        # setting is only needed by the cert master.
-        if 'ssl-synced-units' not in leader_get():
-            rid = relation_ids('cluster')[0]
-            relation_set_and_migrate_to_leader(relation_id=rid,
-                                               **{'ssl-synced-units':
-                                                  ssl_synced_units})
-        else:
-            leader_set({'ssl-synced-units': ssl_synced_units})
-
-    if restart_trigger:
-        log("Sending restart-services-trigger=%s to all peers" %
-            (restart_trigger), level=DEBUG)
-        cluster_rel_settings['restart-services-trigger'] = restart_trigger
-
-    log("Sync complete", level=DEBUG)
-    return cluster_rel_settings
-
-
-def clear_ssl_synced_units():
-    """Clear the 'synced' units record on the cluster relation.
-
-    If new unit sync reauests are set this will ensure that a sync occurs when
-    the sync master receives the requests.
-    """
-    log("Clearing ssl sync units", level=DEBUG)
-    for rid in relation_ids('cluster'):
-        if 'ssl-synced-units' not in leader_get():
-            relation_set_and_migrate_to_leader(relation_id=rid,
-                                               **{'ssl-synced-units': None})
-        else:
-            leader_set({'ssl-synced-units': None})
-
-
-def update_hash_from_path(hash, path, recurse_depth=10):
-    """Recurse through path and update the provided hash for every file found.
-    """
-    if not recurse_depth:
-        log("Max recursion depth (%s) reached for update_hash_from_path() at "
-            "path='%s' - not going any deeper" % (recurse_depth, path),
-            level=WARNING)
-        return
-
-    for p in glob.glob("%s/*" % path):
-        if os.path.isdir(p):
-            update_hash_from_path(hash, p, recurse_depth=recurse_depth - 1)
-        else:
-            with open(p, 'r') as fd:
-                hash.update(fd.read())
-
-
-def synchronize_ca_if_changed(force=False, fatal=False):
-    """Decorator to perform ssl cert sync if decorated function modifies them
-    in any way.
-
-    If force is True a sync is done regardless.
-    """
-    def inner_synchronize_ca_if_changed1(f):
-        def inner_synchronize_ca_if_changed2(*args, **kwargs):
-            # Only sync master can do sync. Ensure (a) we are not nested and
-            # (b) a master is elected and we are it.
-            acquired = SSL_SYNC_SEMAPHORE.acquire(blocking=0)
-            try:
-                if not acquired:
-                    log("Nested sync - ignoring", level=DEBUG)
-                    return f(*args, **kwargs)
-
-                if not ensure_ssl_cert_master():
-                    log("Not ssl-cert-master - ignoring sync", level=DEBUG)
-                    return f(*args, **kwargs)
-
-                peer_settings = {}
-                if not force:
-                    hash1 = hashlib.sha256()
-                    for path in SSL_DIRS:
-                        update_hash_from_path(hash1, path)
-
-                    ret = f(*args, **kwargs)
-
-                    hash2 = hashlib.sha256()
-                    for path in SSL_DIRS:
-                        update_hash_from_path(hash2, path)
-
-                    if hash1.hexdigest() != hash2.hexdigest():
-                        log("SSL certs have changed - syncing peers",
-                            level=DEBUG)
-                        peer_settings = synchronize_ca(fatal=fatal)
-                    else:
-                        log("SSL certs have not changed - skipping sync",
-                            level=DEBUG)
-                else:
-                    ret = f(*args, **kwargs)
-                    log("Doing forced ssl cert sync", level=DEBUG)
-                    peer_settings = synchronize_ca(fatal=fatal)
-
-                # If we are the sync master but not leader, ensure we have
-                # relinquished master status.
-                cluster_rids = relation_ids('cluster')
-                if cluster_rids:
-                    master = relation_get('ssl-cert-master',
-                                          rid=cluster_rids[0],
-                                          unit=local_unit())
-                    if not is_leader() and master == local_unit():
-                        log("Re-electing ssl cert master.", level=INFO)
-                        peer_settings['ssl-cert-master'] = 'unknown'
-
-                    if peer_settings:
-                        relation_set(relation_id=cluster_rids[0],
-                                     relation_settings=peer_settings)
-
-                return ret
-            finally:
-                SSL_SYNC_SEMAPHORE.release()
-
-        return inner_synchronize_ca_if_changed2
-
-    return inner_synchronize_ca_if_changed1
-
-
-@synchronize_ca_if_changed(force=True, fatal=True)
-def force_ssl_sync():
-    """Force SSL sync to all peers.
-
-    This is useful if we need to relinquish ssl-cert-master status while
-    making sure that the new master has up-to-date certs.
-    """
-    return
-
-
-def ensure_ssl_dir():
-    """Ensure juju ssl dir exists and is unsion read/writable."""
-    # NOTE(thedac) Snap service restarts will override permissions
-    # in SNAP_LIB_DIR including SSL_DIR
-    perms = 0o775
-    if not os.path.isdir(SSL_DIR):
-        mkdir(SSL_DIR, SSH_USER, KEYSTONE_USER, perms)
-    else:
-        ensure_permissions(SSL_DIR, user=SSH_USER, group=KEYSTONE_USER,
-                           perms=perms)
-
-
-def get_ca(user=KEYSTONE_USER, group=KEYSTONE_USER):
-    """Initialize a new CA object if one hasn't already been loaded.
-
-    This will create a new CA or load an existing one.
-    """
-    if not ssl.CA_SINGLETON:
-        ensure_ssl_dir()
-        d_name = '_'.join(SSL_CA_NAME.lower().split(' '))
-        ca = ssl.JujuCA(name=SSL_CA_NAME, user=user, group=group,
-                        ca_dir=os.path.join(SSL_DIR,
-                                            '%s_intermediate_ca' % d_name),
-                        root_ca_dir=os.path.join(SSL_DIR,
-                                                 '%s_root_ca' % d_name))
-
-        # Ensure a master is elected. This should cover the following cases:
-        # * single unit == 'oldest' unit is elected as master
-        # * multi unit + not clustered == 'oldest' unit is elcted as master
-        # * multi unit + clustered == cluster leader is elected as master
-        ensure_ssl_cert_master()
-
-        ssl.CA_SINGLETON.append(ca)
-
-    return ssl.CA_SINGLETON[0]
-
-
-def relation_list(rid):
-    cmd = [
-        'relation-list',
-        '-r', rid,
-    ]
-    result = str(subprocess.check_output(cmd)).split()
-    if result == "":
-        return None
-    else:
-        return result
 
 
 def create_user_credentials(user, passwd_get_callback, passwd_set_callback,
@@ -1955,9 +1458,9 @@ def create_user_credentials(user, passwd_get_callback, passwd_set_callback,
             level=INFO)
         return
 
-    log("Creating service credentials for '%s'" % user, level=DEBUG)
+    log("Creating service credentials for '{}'".format(user), level=DEBUG)
     if user_exists(user, domain=domain):
-        log("User '%s' already exists" % (user), level=DEBUG)
+        log("User '{}' already exists".format(user), level=DEBUG)
         # NOTE(dosaboy): see LP #1648677
         if is_password_changed(user, passwd):
             update_user_password(user, passwd, domain)
@@ -1972,13 +1475,13 @@ def create_user_credentials(user, passwd_get_callback, passwd_set_callback,
             grant_role(user, role, tenant=tenant, user_domain=domain,
                        project_domain=domain)
     else:
-        log("No role grants requested for user '%s'" % (user), level=DEBUG)
+        log("No role grants requested for user '{}'".format(user), level=DEBUG)
 
     if new_roles:
         # Allow the remote service to request creation of any additional roles.
         # Currently used by Swift and Ceilometer.
         for role in new_roles:
-            log("Creating requested role '%s'" % role, level=DEBUG)
+            log("Creating requested role '{}'".format(role), level=DEBUG)
             create_role(role, user=user, tenant=tenant, domain=domain)
 
     return passwd
@@ -2001,22 +1504,25 @@ def create_service_credentials(user, new_roles=None):
     if not tenant:
         raise Exception("No service tenant provided in config")
 
-    domain = None
-    if get_api_version() > 2:
-        domain = DEFAULT_DOMAIN
-    passwd = create_user_credentials(user, get_service_password,
-                                     set_service_password,
-                                     tenant=tenant, new_roles=new_roles,
-                                     grants=[config('admin-role')],
-                                     domain=domain)
-    if get_api_version() > 2:
-        # Create account in SERVICE_DOMAIN as well using same password
-        domain = SERVICE_DOMAIN
+    if get_api_version() < 3:
         passwd = create_user_credentials(user, get_service_password,
                                          set_service_password,
                                          tenant=tenant, new_roles=new_roles,
                                          grants=[config('admin-role')],
-                                         domain=domain)
+                                         domain=None)
+    else:
+        # api version 3 or above
+        create_user_credentials(user, get_service_password,
+                                set_service_password,
+                                tenant=tenant, new_roles=new_roles,
+                                grants=[config('admin-role')],
+                                domain=DEFAULT_DOMAIN)
+        # Create account in SERVICE_DOMAIN as well using same password
+        passwd = create_user_credentials(user, get_service_password,
+                                         set_service_password,
+                                         tenant=tenant, new_roles=new_roles,
+                                         grants=[config('admin-role')],
+                                         domain=SERVICE_DOMAIN)
     return passwd
 
 
@@ -2024,15 +1530,14 @@ def add_service_to_keystone(relation_id=None, remote_unit=None):
     manager = get_manager()
     settings = relation_get(rid=relation_id, unit=remote_unit)
     # the minimum settings needed per endpoint
-    single = set(['service', 'region', 'public_url', 'admin_url',
-                  'internal_url'])
+    single = {'service', 'region', 'public_url', 'admin_url', 'internal_url'}
     https_cns = []
 
     protocol = get_protocol()
 
     if single.issubset(settings):
         # other end of relation advertised only one endpoint
-        if 'None' in settings.itervalues():
+        if 'None' in settings.values():
             # Some backend services advertise no endpoint but require a
             # hook execution to update auth strategy.
             relation_data = {}
@@ -2048,13 +1553,11 @@ def add_service_to_keystone(relation_id=None, remote_unit=None):
             relation_data["api_version"] = get_api_version()
             relation_data["admin_domain_id"] = leader_get(
                 attribute='admin_domain_id')
-            # Get and pass CA bundle settings
-            relation_data.update(get_ssl_ca_settings())
 
             # Allow the remote service to request creation of any additional
             # roles. Currently used by Horizon
             for role in get_requested_roles(settings):
-                log("Creating requested role: %s" % role)
+                log("Creating requested role: {}".format(role))
                 create_role(role)
 
             peer_store_and_set(relation_id=relation_id, **relation_data)
@@ -2072,14 +1575,16 @@ def add_service_to_keystone(relation_id=None, remote_unit=None):
             service_username = settings['service']
             prefix = config('service-admin-prefix')
             if prefix:
-                service_username = "%s%s" % (prefix, service_username)
+                service_username = "{}{}".format(prefix, service_username)
 
             # NOTE(jamespage) internal IP for backwards compat for SSL certs
-            internal_cn = urlparse.urlparse(settings['internal_url']).hostname
+            internal_cn = (urllib.parse
+                           .urlparse(settings['internal_url']).hostname)
             https_cns.append(internal_cn)
-            public_cn = urlparse.urlparse(settings['public_url']).hostname
+            public_cn = urllib.parse.urlparse(settings['public_url']).hostname
             https_cns.append(public_cn)
-            https_cns.append(urlparse.urlparse(settings['admin_url']).hostname)
+            https_cns.append(
+                urllib.parse.urlparse(settings['admin_url']).hostname)
     else:
         # assemble multiple endpoints from relation data. service name
         # should be prepended to setting name, ie:
@@ -2097,8 +1602,8 @@ def add_service_to_keystone(relation_id=None, remote_unit=None):
         #       'public_url': $foo
         #   }
         # }
-        endpoints = {}
-        for k, v in settings.iteritems():
+        endpoints = OrderedDict()  # for Python3 we need a consistent order
+        for k, v in settings.items():
             ep = k.split('_')[0]
             x = '_'.join(k.split('_')[1:])
             if ep not in endpoints:
@@ -2106,7 +1611,6 @@ def add_service_to_keystone(relation_id=None, remote_unit=None):
             endpoints[ep][x] = v
 
         services = []
-        https_cn = None
         for ep in endpoints:
             # weed out any unrelated relation stuff Juju might have added
             # by ensuring each possible endpiont has appropriate fields
@@ -2121,19 +1625,22 @@ def add_service_to_keystone(relation_id=None, remote_unit=None):
                 services.append(ep['service'])
                 # NOTE(jamespage) internal IP for backwards compat for
                 # SSL certs
-                internal_cn = urlparse.urlparse(ep['internal_url']).hostname
+                internal_cn = (urllib.parse
+                               .urlparse(ep['internal_url']).hostname)
                 https_cns.append(internal_cn)
-                https_cns.append(urlparse.urlparse(ep['public_url']).hostname)
-                https_cns.append(urlparse.urlparse(ep['admin_url']).hostname)
+                https_cns.append(
+                    urllib.parse.urlparse(ep['public_url']).hostname)
+                https_cns.append(
+                    urllib.parse.urlparse(ep['admin_url']).hostname)
 
-        service_username = '_'.join(services)
+        service_username = '_'.join(sorted(services))
 
         # If an admin username prefix is provided, ensure all services use it.
         prefix = config('service-admin-prefix')
         if service_username and prefix:
-            service_username = "%s%s" % (prefix, service_username)
+            service_username = "{}{}".format(prefix, service_username)
 
-    if 'None' in settings.itervalues():
+    if 'None' in settings.values():
         return
 
     if not service_username:
@@ -2144,8 +1651,10 @@ def add_service_to_keystone(relation_id=None, remote_unit=None):
     service_password = create_service_credentials(service_username,
                                                   new_roles=roles)
     service_domain = None
+    service_domain_id = None
     if get_api_version() > 2:
         service_domain = SERVICE_DOMAIN
+        service_domain_id = manager.resolve_domain_id(SERVICE_DOMAIN)
     service_tenant = config('service-tenant')
     service_tenant_id = manager.resolve_tenant_id(service_tenant,
                                                   domain=service_domain)
@@ -2161,6 +1670,7 @@ def add_service_to_keystone(relation_id=None, remote_unit=None):
         "service_username": service_username,
         "service_password": service_password,
         "service_domain": service_domain,
+        "service_domain_id": service_domain_id,
         "service_tenant": service_tenant,
         "service_tenant_id": service_tenant_id,
         "https_keystone": '__null__',
@@ -2172,25 +1682,6 @@ def add_service_to_keystone(relation_id=None, remote_unit=None):
         "api_version": get_api_version(),
         "admin_domain_id": leader_get(attribute='admin_domain_id'),
     }
-
-    # generate or get a new cert/key for service if set to manage certs.
-    https_service_endpoints = config('https-service-endpoints')
-    if https_service_endpoints and bool_from_string(https_service_endpoints):
-        ca = get_ca(user=SSH_USER)
-        # NOTE(jamespage) may have multiple cns to deal with to iterate
-        https_cns = set(https_cns)
-        for https_cn in https_cns:
-            cert, key = ca.get_cert_and_key(common_name=https_cn)
-            relation_data['ssl_cert_{}'.format(https_cn)] = b64encode(cert)
-            relation_data['ssl_key_{}'.format(https_cn)] = b64encode(key)
-
-        # NOTE(jamespage) for backwards compatibility
-        cert, key = ca.get_cert_and_key(common_name=internal_cn)
-        relation_data['ssl_cert'] = b64encode(cert)
-        relation_data['ssl_key'] = b64encode(key)
-
-        # Get and pass CA bundle settings
-        relation_data.update(get_ssl_ca_settings())
 
     peer_store_and_set(relation_id=relation_id, **relation_data)
     # NOTE(dosaboy): '__null__' settings are for peer relation only so that
@@ -2257,28 +1748,8 @@ def add_credentials_to_keystone(relation_id=None, remote_unit=None):
     }
     if domain:
         relation_data['domain'] = domain
-    # Get and pass CA bundle settings
-    relation_data.update(get_ssl_ca_settings())
 
     peer_store_and_set(relation_id=relation_id, **relation_data)
-
-
-def get_ssl_ca_settings():
-    """ Get the Certificate Authority settings required to use the CA
-
-    :returns: Dictionary with https_keystone and ca_cert set
-    """
-    ca_data = {}
-    https_service_endpoints = config('https-service-endpoints')
-    if (https_service_endpoints and
-            bool_from_string(https_service_endpoints)):
-        # Pass CA cert as client will need it to
-        # verify https connections
-        ca = get_ca(user=SSH_USER)
-        ca_bundle = ca.get_ca_bundle()
-        ca_data['https_keystone'] = 'True'
-        ca_data['ca_cert'] = b64encode(ca_bundle)
-    return ca_data
 
 
 def get_protocol():
@@ -2295,7 +1766,7 @@ def get_protocol():
 
 def ensure_valid_service(service):
     if service not in valid_services.keys():
-        log("Invalid service requested: '%s'" % service)
+        log("Invalid service requested: '{}'".format(service))
         relation_set(admin_token=-1)
         return
 
@@ -2382,14 +1853,14 @@ def send_notifications(data, force=False):
     for rid in rel_ids:
         rs = relation_get(unit=local_unit(), rid=rid)
         if rs:
-            keys += rs.keys()
+            keys += list(rs.keys())
 
         # Don't bother checking if we have already identified a diff
         if diff:
             continue
 
         # Work out if this notification changes anything
-        for k, v in data.iteritems():
+        for k, v in data.items():
             if rs.get(k, None) != v:
                 diff = True
                 break
@@ -2403,14 +1874,14 @@ def send_notifications(data, force=False):
     _notifications = {k: None for k in set(keys)}
 
     # Set new values
-    for k, v in data.iteritems():
+    for k, v in data.items():
         _notifications[k] = v
 
     if force:
         _notifications['trigger'] = str(uuid.uuid4())
 
     # Broadcast
-    log("Sending identity-service notifications (trigger=%s)" % (force),
+    log("Sending identity-service notifications (trigger={})".format(force),
         level=DEBUG)
     for rid in rel_ids:
         relation_set(relation_id=rid, relation_settings=_notifications)
@@ -2424,7 +1895,7 @@ def is_db_ready(use_current_context=False, db_rel=None):
     returns True otherwise False.
     """
     key = 'allowed_units'
-    db_rels = ['shared-db', 'pgsql-db']
+    db_rels = ['shared-db']
     if db_rel:
         db_rels = [db_rel]
 
@@ -2432,16 +1903,16 @@ def is_db_ready(use_current_context=False, db_rel=None):
 
     if use_current_context:
         if not any([relation_id() in relation_ids(r) for r in db_rels]):
-            raise Exception("use_current_context=True but not in one of %s "
-                            "rel hook contexts (currently in %s)." %
-                            (', '.join(db_rels), relation_id()))
+            raise Exception("use_current_context=True but not in one of {} "
+                            "rel hook contexts (currently in {})."
+                            .format(', '.join(db_rels), relation_id()))
 
         allowed_units = relation_get(attribute=key)
         if allowed_units and local_unit() in allowed_units.split():
             return True
 
         # We are in shared-db rel but don't yet have permissions
-        log("%s does not yet have db permissions" % (local_unit()),
+        log("{} does not yet have db permissions".format(local_unit()),
             level=DEBUG)
         return False
     else:
@@ -2460,23 +1931,10 @@ def is_db_ready(use_current_context=False, db_rel=None):
     return not rel_has_units
 
 
-def determine_usr_bin():
-    """Return the /usr/bin path for Apache2 vhost config.
-    The /usr/bin path will be located in the virtualenv if the charm
-    is configured to deploy keystone from source.
-    """
-    if git_install_requested():
-        projects_yaml = config('openstack-origin-git')
-        projects_yaml = git_default_repos(projects_yaml)
-        return os.path.join(git_pip_venv_dir(projects_yaml), 'bin')
-    else:
-        return '/usr/bin'
-
-
 def determine_python_path():
     """Return the python-path
 
-    Determine if git or snap installed and return the appropriate python path.
+    Determine if snap installed and return the appropriate python path.
     Returns None unless the charm if neither condition is true.
 
     :returns: string python path or None
@@ -2484,106 +1942,8 @@ def determine_python_path():
     _python_path = 'lib/python2.7/site-packages'
     if snap_install_requested():
         return os.path.join(SNAP_BASE_DIR, _python_path)
-    elif git_install_requested():
-        projects_yaml = config('openstack-origin-git')
-        projects_yaml = git_default_repos(projects_yaml)
-        return os.path.join(git_pip_venv_dir(projects_yaml), _python_path)
     else:
         return None
-
-
-def git_install(projects_yaml):
-    """Perform setup, and install git repos specified in yaml parameter."""
-    if git_install_requested():
-        git_pre_install()
-        projects_yaml = git_default_repos(projects_yaml)
-        git_clone_and_install(projects_yaml, core_project='keystone')
-        git_post_install(projects_yaml)
-
-
-def git_pre_install():
-    """Perform keystone pre-install setup."""
-    dirs = [
-        '/var/lib/keystone',
-        '/var/lib/keystone/cache',
-        '/var/log/keystone',
-    ]
-
-    logs = [
-        '/var/log/keystone/keystone.log',
-    ]
-
-    adduser('keystone', shell='/bin/bash', system_user=True,
-            home_dir='/var/lib/keystone')
-    add_group('keystone', system_group=True)
-    add_user_to_group('keystone', 'keystone')
-
-    for d in dirs:
-        mkdir(d, owner=KEYSTONE_USER, group=KEYSTONE_USER, perms=0o755,
-              force=False)
-
-    for l in logs:
-        write_file(l, '', owner=KEYSTONE_USER, group=KEYSTONE_USER,
-                   perms=0o600)
-
-
-def git_post_install(projects_yaml):
-    """Perform keystone post-install setup."""
-    http_proxy = git_yaml_value(projects_yaml, 'http_proxy')
-    if http_proxy:
-        pip_install('mysql-python', proxy=http_proxy,
-                    venv=git_pip_venv_dir(projects_yaml))
-    else:
-        pip_install('mysql-python',
-                    venv=git_pip_venv_dir(projects_yaml))
-
-    src_etc = os.path.join(git_src_dir(projects_yaml, 'keystone'), 'etc')
-    configs = {
-        'src': src_etc,
-        'dest': '/etc/keystone',
-    }
-
-    if os.path.exists(configs['dest']):
-        shutil.rmtree(configs['dest'])
-    shutil.copytree(configs['src'], configs['dest'])
-
-    # NOTE(coreycb): Need to find better solution than bin symlinks.
-    symlinks = [
-        {'src': os.path.join(git_pip_venv_dir(projects_yaml),
-                             'bin/keystone-manage'),
-         'link': '/usr/local/bin/keystone-manage'},
-    ]
-
-    for s in symlinks:
-        if os.path.lexists(s['link']):
-            os.remove(s['link'])
-        os.symlink(s['src'], s['link'])
-
-    render('git/logging.conf', '/etc/keystone/logging.conf', {}, perms=0o644)
-
-    bin_dir = os.path.join(git_pip_venv_dir(projects_yaml), 'bin')
-    # The charm runs the keystone API under apache2 for openstack liberty
-    # onward.  Prior to liberty upstart is used.
-    if CompareOpenStackReleases(os_release('keystone')) < 'liberty':
-        keystone_context = {
-            'service_description': 'Keystone API server',
-            'service_name': 'Keystone',
-            'user_name': 'keystone',
-            'start_dir': '/var/lib/keystone',
-            'process_name': 'keystone',
-            'executable_name': os.path.join(bin_dir, 'keystone-all'),
-            'config_files': ['/etc/keystone/keystone.conf'],
-        }
-
-        keystone_context['log_file'] = '/var/log/keystone/keystone.log'
-        templates_dir = 'hooks/charmhelpers/contrib/openstack/templates'
-        templates_dir = os.path.join(charm_dir(), templates_dir)
-        render('git.upstart', '/etc/init/keystone.conf', keystone_context,
-               perms=0o644, templates_dir=templates_dir)
-
-    # Don't restart if the unit is supposed to be paused.
-    if not is_unit_paused_set():
-        service_restart(keystone_service())
 
 
 def get_optional_interfaces():
@@ -2716,3 +2076,233 @@ def post_snap_install():
     if os.path.exists(PASTE_SRC):
         log("Perfoming post snap install tasks", INFO)
         shutil.copy(PASTE_SRC, PASTE_DST)
+
+
+def restart_keystone():
+    if not is_unit_paused_set():
+        if snap_install_requested():
+            service_restart('snap.keystone.*')
+        else:
+            service_restart(keystone_service())
+
+
+def key_setup():
+    """Initialize Fernet and Credential encryption key repositories
+
+    To setup the key repositories, calls (as user "keystone"):
+
+        keystone-manage fernet_setup
+        keystone-manage credential_setup
+
+    In addition we migrate any credentials currently stored in database using
+    the null key to be encrypted by the new credential key:
+
+        keystone-manage credential_migrate
+
+    Note that we only want to do this once, so we store success in the leader
+    settings (which we should be).
+
+    :raises: `:class:subprocess.CallProcessError` if either of the commands
+        fails.
+    """
+    if os.path.exists(KEY_SETUP_FILE) or not is_leader():
+        return
+    base_cmd = ['sudo', '-u', 'keystone', 'keystone-manage']
+    try:
+        log("Setting up key repositories for Fernet tokens and Credential "
+            "encryption", level=DEBUG)
+        subprocess.check_call(base_cmd + ['fernet_setup'])
+        subprocess.check_call(base_cmd + ['credential_setup'])
+        subprocess.check_call(base_cmd + ['credential_migrate'])
+        # touch the file to create
+        open(KEY_SETUP_FILE, "w").close()
+    except subprocess.CalledProcessError as e:
+        log("Key repository setup failed, will retry in config-changed hook: "
+            "{}".format(e), level=ERROR)
+
+
+def fernet_rotate():
+    """Rotate Fernet keys
+
+    To rotate the Fernet tokens, and create a new staging key, it calls (as the
+    "keystone" user):
+
+        keystone-manage fernet_rotate
+
+    Note that we do not rotate the Credential encryption keys.
+
+    Note that this does NOT synchronise the keys between the units.  This is
+    performed in `:function:`hooks.keystone_utils.fernet_leader_set`
+
+    :raises: `:class:subprocess.CallProcessError` if the command fails.
+    """
+    log("Rotating Fernet tokens", level=DEBUG)
+    cmd = ['sudo', '-u', 'keystone', 'keystone-manage', 'fernet_rotate']
+    subprocess.check_call(cmd)
+
+
+def key_leader_set():
+    """Read current key sets and update leader storage
+
+    The keys are read from the `FERNET_KEY_REPOSITORY` and
+    `CREDENTIAL_KEY_REPOSITORY` directories.  Note that this function will fail
+    if it is called on the unit that is not the leader.
+
+    :raises: :class:`subprocess.CalledProcessError` if the leader_set fails.
+    """
+    disk_keys = {}
+    for key_repository in [FERNET_KEY_REPOSITORY, CREDENTIAL_KEY_REPOSITORY]:
+        disk_keys[key_repository] = {}
+        for key_number in os.listdir(key_repository):
+            with open(os.path.join(key_repository, key_number),
+                      'r') as f:
+                disk_keys[key_repository][key_number] = f.read()
+    leader_set({'key_repository': json.dumps(disk_keys)})
+
+
+def key_write():
+    """Get keys from leader storage and write out to disk
+
+    The keys are written to the `FERNET_KEY_REPOSITORY` and
+    `CREDENTIAL_KEY_REPOSITORY` directories.  Note that the keys are first
+    written to a tmp file and then moved to the key to avoid any races.  Any
+    'excess' keys are deleted, which may occur if the "number of keys" has been
+    reduced on the leader.
+    """
+    leader_keys = leader_get('key_repository')
+    if not leader_keys:
+        log('"key_repository" not in leader settings yet...', level=DEBUG)
+        return
+    leader_keys = json.loads(leader_keys)
+    for key_repository in [FERNET_KEY_REPOSITORY, CREDENTIAL_KEY_REPOSITORY]:
+        mkdir(key_repository,
+              owner=KEYSTONE_USER,
+              group=KEYSTONE_USER,
+              perms=0o700)
+        for key_number, key in leader_keys[key_repository].items():
+            tmp_filename = os.path.join(key_repository,
+                                        ".{}".format(key_number))
+            key_filename = os.path.join(key_repository, key_number)
+            # write to tmp file first, move the key into place in an atomic
+            # operation avoiding any races with consumers of the key files
+            write_file(tmp_filename,
+                       key,
+                       owner=KEYSTONE_USER,
+                       group=KEYSTONE_USER,
+                       perms=0o600)
+            os.rename(tmp_filename, key_filename)
+        # now delete any keys that shouldn't be there
+        for key_number in os.listdir(key_repository):
+            if key_number not in leader_keys[key_repository].keys():
+                os.remove(os.path.join(key_repository, key_number))
+        # also say that keys have been setup for this system.
+        open(KEY_SETUP_FILE, "w").close()
+
+
+def fernet_keys_rotate_and_sync(log_func=log):
+    """Rotate and sync the keys if the unit is the leader and the primary key
+    has expired.
+
+    The modification time of the staging key (key with index '0') is used,
+    along with the config setting "token_expiration" to determine whether to
+    rotate the keys, along with the function `fernet_enabled()` to test
+    whether to do it at all.
+
+    Note that the reason for using modification time and not change time is
+    that the former can be set by the operator as part of restoring the key
+    from backup.
+
+    The rotation time = token-expiration / (max-active-keys - 2)
+
+    where max-active-keys has a minumum of 3.
+
+    :param log_func: Function to use for logging
+    :type log_func: func
+    """
+    if not keystone_context.fernet_enabled() or not is_leader():
+        return
+    if is_unit_paused_set():
+        log_func("Fernet key rotation requested but unit is paused",
+                 level=INFO)
+        return
+    # now see if the keys need to be rotated
+    try:
+        last_rotation = os.stat(
+            os.path.join(FERNET_KEY_REPOSITORY, '0')).st_mtime
+    except OSError:
+        log_func("Fernet key rotation requested but key repository not "
+                 "initialized yet", level=WARNING)
+        return
+    max_keys = max(config('fernet-max-active-keys'), 3)
+    expiration = config('token-expiration')
+    rotation_time = expiration // (max_keys - 2)
+    now = time.time()
+    if last_rotation + rotation_time > now:
+        # Nothing to do as not reached rotation time
+        log_func("No rotation until at least {}"
+                 .format(
+                     time.asctime(time.gmtime(last_rotation + rotation_time))),
+                 level=DEBUG)
+        return
+    # now rotate the keys and sync them
+    fernet_rotate()
+    key_leader_set()
+    log_func("Rotated and started sync (via leader settings) of fernet keys",
+             level=INFO)
+
+
+@cached
+def container_scoped_relations():
+    '''Get all the container scoped relations'''
+    md = metadata()
+    relations = []
+    for relation_type in ('provides', 'requires', 'peers'):
+        for relation in md.get(relation_type, []):
+            if md[relation_type][relation].get('scope') == 'container':
+                relations.append(relation)
+    return relations
+
+
+def is_expected_scale():
+    """Query juju goal-state to determine whether our peer- and dependency-
+    relations are at the expected scale.
+
+    Useful for deferring per unit per relation housekeeping work until we are
+    ready to complete it successfully and without unnecessary repetiton.
+
+    Always returns True if version of juju used does not support goal-state.
+
+    :returns: True or False
+    :rtype: bool
+    """
+    peer_type = 'cluster'
+    peer_rid = next((rid for rid in relation_ids(reltype=peer_type)), None)
+    if not peer_rid:
+        return False
+    deps = [
+        ('shared-db',
+         next((rid for rid in relation_ids(reltype='shared-db')), None)),
+    ]
+    if expect_ha():
+        deps.append(('ha',
+                     next((rid for rid in relation_ids(reltype='ha')), None)))
+    try:
+        if (len(related_units(relid=peer_rid)) <
+                len(list(expected_peer_units()))):
+            return False
+        for dep in deps:
+            if not dep[1]:
+                return False
+            # Goal state returns every unit even for container scoped
+            # relations but the charm only ever has a relation with
+            # the local unit.
+            if dep[0] in container_scoped_relations():
+                expected_count = 1
+            else:
+                expected_count = len(
+                    list(expected_related_units(reltype=dep[0])))
+            if len(related_units(relid=dep[1])) < expected_count:
+                return False
+    except NotImplementedError:
+        return True
+    return True
